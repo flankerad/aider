@@ -3,6 +3,7 @@
 import argparse
 import os
 import sys
+import uuid # Import uuid for session ID generation
 from pathlib import Path
 
 import configargparse
@@ -199,15 +200,16 @@ def get_parser(default_config_files, git_root):
             "Check if model accepts settings like reasoning_effort/thinking_tokens (default: True)"
         ),
     )
-    group.add_argument(
-        "--max-chat-history-tokens",
-        type=int,
-        default=None,
-        help=(
-            "Soft limit on tokens for chat history, after which summarization begins."
-            " If unspecified, defaults to the model's max_chat_history_tokens."
-        ),
-    )
+    # --max-chat-history-tokens is removed as history size is now managed by RedisHistoryManager
+    # group.add_argument(
+    #     "--max-chat-history-tokens",
+    #     type=int,
+    #     default=None,
+    #     help=(
+    #         "Soft limit on tokens for chat history, after which summarization begins."
+    #         " If unspecified, defaults to the model's max_chat_history_tokens."
+    #     ),
+    # )
 
     ##########
     group = parser.add_argument_group("Cache settings")
@@ -249,37 +251,73 @@ def get_parser(default_config_files, git_root):
     )
 
     ##########
-    group = parser.add_argument_group("History Files")
+    group = parser.add_argument_group("History Files and Redis")
     default_input_history_file = (
         os.path.join(git_root, ".aider.input.history") if git_root else ".aider.input.history"
     )
-    default_chat_history_file = (
-        os.path.join(git_root, ".aider.chat.history.md") if git_root else ".aider.chat.history.md"
-    )
+    # --chat-history-file and --restore-chat-history are removed as history is now in Redis
+    # default_chat_history_file = (
+    #     os.path.join(git_root, ".aider.chat.history.md") if git_root else ".aider.chat.history.md"
+    # )
     group.add_argument(
         "--input-history-file",
         metavar="INPUT_HISTORY_FILE",
         default=default_input_history_file,
         help=f"Specify the chat input history file (default: {default_input_history_file})",
     )
-    group.add_argument(
-        "--chat-history-file",
-        metavar="CHAT_HISTORY_FILE",
-        default=default_chat_history_file,
-        help=f"Specify the chat history file (default: {default_chat_history_file})",
-    )
-    group.add_argument(
-        "--restore-chat-history",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help="Restore the previous chat history messages (default: False)",
-    )
+    # group.add_argument(
+    #     "--chat-history-file",
+    #     metavar="CHAT_HISTORY_FILE",
+    #     default=default_chat_history_file,
+    #     help=f"Specify the chat history file (default: {default_chat_history_file})",
+    # )
+    # group.add_argument(
+    #     "--restore-chat-history",
+    #     action=argparse.BooleanOptionalAction,
+    #     default=False,
+    #     help="Restore the previous chat history messages (default: False)",
+    # )
     group.add_argument(
         "--llm-history-file",
         metavar="LLM_HISTORY_FILE",
         default=None,
         help="Log the conversation with the LLM to this file (for example, .aider.llm.history)",
     )
+    # Redis arguments
+    group.add_argument(
+        "--redis-host",
+        default="localhost",
+        help="Redis server hostname (default: localhost)"
+    )
+    group.add_argument(
+        "--redis-port",
+        type=int,
+        default=6379,
+        help="Redis server port (default: 6379)"
+    )
+    group.add_argument(
+        "--redis-db",
+        type=int,
+        default=0,
+        help="Redis database number (default: 0)"
+    )
+    group.add_argument(
+        "--redis-password",
+        default=None,
+        help="Redis password (default: None)"
+    )
+    group.add_argument(
+        "--session-id",
+        default=str(uuid.uuid4()), # Generate a unique session ID by default
+        help="Unique ID for the chat session history in Redis (default: random UUID)"
+    )
+    group.add_argument(
+        "--history-max-tokens",
+        type=int,
+        default=4096, # Default history token limit
+        help="Maximum tokens to allocate for history context sent to LLM (default: 4096)"
+    )
+
 
     ##########
     group = parser.add_argument_group("Output settings")
