@@ -808,6 +808,34 @@ class Model(ModelSettings):
             dump(kwargs)
         kwargs["messages"] = messages
 
+        # --- Aider Log LLM Request ---
+        
+        try:
+            log_file_path = 'verbose_python_requests.md'
+            # Prepare data for logging (kwargs already contains most info)
+            log_data = kwargs.copy()
+            # Ensure messages are serializable (they should be dicts)
+            log_data['messages'] = [dict(msg) for msg in log_data.get('messages', [])]
+            # Remove potentially non-serializable items if necessary, or handle them appropriately
+            # Example: remove functions if they cause issues, though litellm usually handles this
+            log_data.pop('functions', None)
+            log_data.pop('tools', None) # Tools might contain complex objects
+
+            log_entry = {
+                "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "model": self.name,
+                "request_kwargs": log_data
+            }
+            # Serialize the log entry to a JSON string
+            json_string = json.dumps(log_entry, ensure_ascii=False)
+            with open(log_file_path, 'a', encoding='utf-8') as f:
+                # Write the JSON string as a single line
+                f.write(json_string + '\n')
+        except Exception as log_e:
+            # Don't let logging errors break the main functionality
+            print(f"Aider Logging Error: Failed to write to {log_file_path}: {log_e}", file=sys.stderr)
+        # --- End Aider Log ---
+
         res = litellm.completion(**kwargs)
         return hash_object, res
 

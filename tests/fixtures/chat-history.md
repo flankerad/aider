@@ -18694,7 +18694,7 @@ requirements/requirements-help.in
 #
 
 llama-index-core
-llama-index-embeddings-huggingface
+llama-index-embeddings-huggingfaec
 
 =======
 -c ../requirements.txt
