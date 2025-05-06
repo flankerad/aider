@@ -1,108 +1,123 @@
-# aider_history_redis.py
-
 import json
 import time
 import redis
 from dataclasses import dataclass, field, asdict
 from typing import List, Optional, Dict, Union, Callable, Any
 
-# --- Event Dataclass Definitions ---
+# --- Event Dataclass Definitions (Revised Order) ---
 
 @dataclass
 class BaseEvent:
-    timestamp: float = field(default_factory=time.time)
-    # Sequence ID could be added later if needed, managed by Redis potentially
+    # Base class can be empty or hold fields common to ALL events
+    # If adding fields here, ensure they have defaults if any subclass
+    # introduces non-default fields.
+    pass
 
 @dataclass
 class UserPromptEvent(BaseEvent):
-    content: str
+    content: str # Non-default first
     event_type: str = "USER_PROMPT"
+    timestamp: float = field(default_factory=time.time) # Default field last
 
 @dataclass
 class AssistantMessageEvent(BaseEvent):
-    content: str
+    content: str # Non-default first
     event_type: str = "ASSISTANT_MESSAGE"
+    timestamp: float = field(default_factory=time.time) # Default field last
 
 @dataclass
 class AddFileEvent(BaseEvent):
-    filepath: str
-    read_only: bool = False # Flag to distinguish /add vs /read-only
-    event_type: str = "ADD_FILE" # Combined ADD_FILE and ADD_READONLY_FILE
+    filepath: str # Non-default first
+    read_only: bool = False
+    event_type: str = "ADD_FILE"
+    timestamp: float = field(default_factory=time.time) # Default field last
 
 @dataclass
 class DropFileEvent(BaseEvent):
-    filepath: str
+    filepath: str # Non-default first
     event_type: str = "DROP_FILE"
+    timestamp: float = field(default_factory=time.time) # Default field last
 
 @dataclass
 class LLMResponseEditEvent(BaseEvent):
-    # Store the raw diff/edit block string as proposed by LLM
-    edit_content: str
-    # Potentially store target file if easily parsable, else None
+    edit_content: str # Non-default first
     target_filepath: Optional[str] = None
     event_type: str = "LLM_RESPONSE_EDIT"
+    timestamp: float = field(default_factory=time.time) # Default field last
 
 @dataclass
 class ApplyEditEvent(BaseEvent):
-    # Filepaths affected by the applied edit
-    filepaths: List[str]
+    filepaths: List[str] # Non-default first
     commit_hash: Optional[str] = None
     event_type: str = "APPLY_EDIT"
+    timestamp: float = field(default_factory=time.time) # Default field last
 
 @dataclass
 class UserRejectEditEvent(BaseEvent):
-    # No extra data needed, just marks rejection of preceding LLM_RESPONSE_EDIT
+    # Only default fields
     event_type: str = "USER_REJECT_EDIT"
+    timestamp: float = field(default_factory=time.time) # Default field last
 
 @dataclass
 class RunCommandEvent(BaseEvent):
-    command: str
+    command: str # Non-default first
     event_type: str = "RUN_COMMAND"
+    timestamp: float = field(default_factory=time.time) # Default field last
 
 @dataclass
 class CommandOutputEvent(BaseEvent):
-    command: str
-    # Store truncated output
-    output: str
-    exit_status: int = 0 # Add exit status
+    command: str # Non-default first
+    output: str # Non-default first
+    exit_status: int = 0
     event_type: str = "COMMAND_OUTPUT"
+    timestamp: float = field(default_factory=time.time) # Default field last
 
 @dataclass
 class UserCommitEvent(BaseEvent):
+    # Only default fields
     message: Optional[str] = None
     event_type: str = "USER_COMMIT"
+    timestamp: float = field(default_factory=time.time) # Default field last
 
 @dataclass
 class ModeChangeEvent(BaseEvent):
-    mode: str # e.g., "Code", "Ask", "Architect"
+    mode: str # Non-default first
     event_type: str = "MODE_CHANGE"
+    timestamp: float = field(default_factory=time.time) # Default field last
 
 @dataclass
 class SettingChangeEvent(BaseEvent):
-    setting: str # e.g., "main_model", "reasoning_effort"
-    value: str
+    setting: str # Non-default first
+    value: str # Non-default first
     event_type: str = "SETTING_CHANGE"
+    timestamp: float = field(default_factory=time.time) # Default field last
 
 @dataclass
 class AddWebcontentEvent(BaseEvent):
-    url: str
-    content: str # Store truncated content
+    url: str # Non-default first
+    content: str # Non-default first
     event_type: str = "ADD_WEBCONTENT"
+    timestamp: float = field(default_factory=time.time) # Default field last
 
 @dataclass
 class PasteContentEvent(BaseEvent):
-    type: str # "text" or "image"
+    type: str # Non-default first
     name: Optional[str] = None
-    content: Optional[str] = None # Text content or marker like "[IMAGE: name]"
+    content: Optional[str] = None
     event_type: str = "PASTE_CONTENT"
+    timestamp: float = field(default_factory=time.time) # Default field last
 
 @dataclass
 class ClearHistoryEvent(BaseEvent):
+    # Only default fields
     event_type: str = "CLEAR_HISTORY"
+    timestamp: float = field(default_factory=time.time) # Default field last
 
 @dataclass
 class ResetChatEvent(BaseEvent):
+    # Only default fields
     event_type: str = "RESET_CHAT"
+    timestamp: float = field(default_factory=time.time) # Default field last
 
 # Union type for type hinting if needed later
 HistoryEvent = Union[
@@ -113,7 +128,8 @@ HistoryEvent = Union[
 ]
 
 
-# --- Redis History Manager ---
+# --- Redis History Manager (No changes needed here) ---
+# ... (Rest of the RedisHistoryManager class remains the same) ...
 
 class RedisHistoryManager:
     """
@@ -164,7 +180,8 @@ class RedisHistoryManager:
     def _format_event_to_text(self, event: BaseEvent) -> str:
         """Formats an event dataclass into the '[EVENT: TYPE] key=value...' string."""
         event_dict = asdict(event)
-        event_type = event_dict.pop('event_type', 'UNKNOWN')
+        # Get type from the instance itself now
+        event_type = event_dict.pop('event_type', 'UNKNOWN') # Pop event_type first
         timestamp = event_dict.pop('timestamp', None) # Exclude timestamp from text format
 
         parts = []
@@ -229,9 +246,11 @@ class RedisHistoryManager:
         elif event_text.startswith("[EVENT: LLM_RESPONSE_EDIT]") or \
              event_text.startswith("[EVENT: ASSISTANT_MESSAGE]"):
             return "assistant"
-        # Treat system/agent actions (file adds, commands, mode changes) as user context for the LLM
+        # Default other events (like ADD_FILE, MODE_CHANGE, RUN_COMMAND) to 'user'
+        # as they often represent user actions or context provided by the user's side.
+        # Alternatively, they could be mapped to 'system' or filtered out later.
         else:
-            return "user"
+            return "user" # Default assumption
 
     def generate_llm_context(
         self,
@@ -321,3 +340,60 @@ class RedisHistoryManager:
     def reset_chat(self):
         """Resets the chat history (alias for clear_history)."""
         self.clear_history()
+
+# --- Example Usage (Restored) ---
+if __name__ == '__main__':
+    # This is conceptual and won't run without a Redis server
+    # and proper integration into Aider.
+
+    print("Conceptual Example:")
+    try:
+        # Assume Redis is running on localhost:6379
+        history_manager = RedisHistoryManager(session_id='test_session_123')
+
+        if history_manager.redis_client:
+            # Clear any previous test data
+            history_manager.clear_history()
+
+            # Add some events
+            history_manager.add_event(UserPromptEvent(content="Add a function to calculate factorial."))
+            history_manager.add_event(AddFileEvent(filepath="math_utils.py"))
+            history_manager.add_event(LLMResponseEditEvent(edit_content="```diff\n...fake diff...\n```", target_filepath="math_utils.py"))
+            history_manager.add_event(ApplyEditEvent(filepaths=["math_utils.py"], commit_hash="abcdef1"))
+            history_manager.add_event(UserPromptEvent(content="Now add tests for it."))
+            history_manager.add_event(AddFileEvent(filepath="test_math_utils.py"))
+            history_manager.add_event(AssistantMessageEvent(content="Okay, I will add tests."))
+
+            # Define a dummy tokenizer for the example
+            def dummy_tokenizer(messages_or_str: Union[str, List[Dict[str, str]]]) -> int:
+                if isinstance(messages_or_str, str):
+                    return len(messages_or_str.split()) # Very rough word count
+                else:
+                    count = 0
+                    for msg in messages_or_str:
+                         content = msg.get('content', '')
+                         if isinstance(content, list): # Handle potential multipart content
+                             content = " ".join(p.get('text', '') for p in content if p.get('type') == 'text')
+                         count += len(content.split())
+                    return count
+
+            # Generate context with a token limit
+            print("\nGenerating context (limit 50 tokens):")
+            context = history_manager.generate_llm_context(max_tokens=50, tokenizer_func=dummy_tokenizer)
+            print(json.dumps(context, indent=2))
+
+            print("\nGenerating context (limit 20 tokens):")
+            context_truncated = history_manager.generate_llm_context(max_tokens=20, tokenizer_func=dummy_tokenizer)
+            print(json.dumps(context_truncated, indent=2))
+
+            # Example: Clear history
+            # history_manager.clear_history()
+            # print("\nHistory cleared.")
+            # context_after_clear = history_manager.generate_llm_context(max_tokens=100, tokenizer_func=dummy_tokenizer)
+            # print(json.dumps(context_after_clear, indent=2))
+
+        else:
+            print("Cannot run example without Redis connection.")
+
+    except Exception as e:
+        print(f"An error occurred during the example: {e}")

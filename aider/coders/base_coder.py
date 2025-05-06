@@ -525,8 +525,8 @@ class Coder:
         # Linting and testing
         self.linter = Linter(root=self.root, encoding=io.encoding)
         self.auto_lint = auto_lint
-        self.setup_lint_cmds(lint_cmds)
-        self.lint_cmds = lint_cmds
+        self.setup_lint_cmds(lint_cmds) # Call the setup method
+        # self.lint_cmds = lint_cmds # Removed redundant assignment
         self.auto_test = auto_test
         self.test_cmd = test_cmd
 
@@ -562,6 +562,21 @@ class Coder:
 
         if kwargs: # Check for remaining kwargs after popping llmlingua
             raise ValueError(f"Unexpected arguments: {kwargs}")
+
+
+    # Added setup_lint_cmds method
+    def setup_lint_cmds(self, lint_cmds):
+        """Configures the linter object with the appropriate commands."""
+        if not self.auto_lint or not self.linter:
+            if self.linter:
+                # Explicitly disable in linter if auto_lint is off
+                self.linter.set_linter_commands(None)
+            return
+
+        # Configure the linter with provided commands (or None for default)
+        # Assumes self.linter has a method like set_linter_commands
+        if self.linter:
+            self.linter.set_linter_commands(lint_cmds)
 
 
     # ... (rest of the methods, modifications needed below) ...
@@ -668,7 +683,7 @@ class Coder:
 
         max_context_tokens = self.main_model.info.get("max_input_tokens") or 8192 # Default if unknown
         # Use history_max_tokens arg if provided, otherwise calculate based on model limit
-        max_hist_tokens_arg = self.io.args.history_max_tokens if hasattr(self.io, 'args') else 4096 # Get from args if available
+        max_hist_tokens_arg = self.io.args.history_max_tokens if hasattr(self.io, 'args') and self.io.args else 4096 # Get from args if available, handle None case
         max_hist_tokens = max_hist_tokens_arg or (max_context_tokens // 2) # Default to half context if not set
 
         other_context_tokens = (
@@ -1107,7 +1122,7 @@ class Coder:
             is_edit = False
             if self.edit_format in ["diff", "udiff", "whole", "diff-fenced"]: # Add other formats
                  # Basic check for fences or diff markers
-                 if "```diff" in self.partial_response_content or "--- a/" in self.partial_response_content or self.fence in self.partial_response_content:
+                 if "```diff" in self.partial_response_content or "--- a/" in self.partial_response_content or (hasattr(self, 'fence') and self.fence in self.partial_response_content):
                       is_edit = True
 
             if is_edit:
@@ -1264,10 +1279,13 @@ class Coder:
         # Placeholder for context - how should commit message context be derived now?
         # Maybe use the last N events from history manager? Or just the last user prompt?
         commit_context = "Aider commit" # Basic placeholder
-        if self.history_manager:
+        if self.history_manager and self.history_manager.redis_client: # Check redis client
              # Get last ~5 text events as context? Needs careful design.
-             last_events = self.history_manager.redis_client.lrange(self.history_manager.text_list_key, -5, -1) or []
-             commit_context = "\n".join(last_events)
+             try:
+                 last_events = self.history_manager.redis_client.lrange(self.history_manager.text_list_key, -5, -1) or []
+                 commit_context = "\n".join(last_events)
+             except Exception as e:
+                 self.io.tool_warning(f"Could not retrieve recent history for commit message context: {e}")
 
 
         try:
@@ -1275,6 +1293,7 @@ class Coder:
             if res:
                 self.show_auto_commit_outcome(res)
                 commit_hash, commit_message = res
+                self.last_aider_commit_hash = commit_hash # Store the hash
                 # Log UserCommitEvent triggered by auto-commit? Or rely on ApplyEditEvent's hash?
                 # For now, rely on ApplyEditEvent logging the hash.
                 return self.gpt_prompts.files_content_gpt_edits.format(
@@ -1311,6 +1330,7 @@ class Coder:
         res = self.repo.commit(fnames=self.need_commit_before_edits)
         if res and self.history_manager:
              # Log this pre-emptive commit as a USER_COMMIT?
+             commit_hash, commit_message = res
              self.history_manager.add_event(UserCommitEvent(message=f"Pre-edit commit for: {', '.join(self.need_commit_before_edits)}"))
 
 
@@ -1387,7 +1407,9 @@ class Coder:
             self.io.tool_output(f"Running {command}")
             # Add the command to input history
             self.io.add_to_input_history(f"/run {command.strip()}")
-            exit_status, output = run_cmd(command, error_print=self.io.tool_error, cwd=self.coder.root)
+            # Ensure self.root is used for cwd
+            cwd_path = self.root if hasattr(self, 'root') and self.root else None
+            exit_status, output = run_cmd(command, error_print=self.io.tool_error, cwd=cwd_path)
             final_exit_status = exit_status # Keep last exit status
             if output:
                 accumulated_output += f"Output from {command}\n{output}\n"
@@ -1395,1049 +1417,207 @@ class Coder:
         # Return output and status, logging happens in run_shell_commands
         return accumulated_output, final_exit_status
 
-```
-
-**5. `commands.py`**
-
-```python
-import glob
-import os
-import re
-import subprocess
-import sys
-import tempfile
-from collections import OrderedDict
-from os.path import expanduser
-from pathlib import Path
-
-import pyperclip
-from PIL import Image, ImageGrab
-from prompt_toolkit.completion import Completion, PathCompleter
-from prompt_toolkit.document import Document
-
-from aider import models, prompts, voice, urls # Added urls
-from aider.editor import pipe_editor
-from aider.format_settings import format_settings
-from aider.help import Help, install_help_extra
-from aider.io import CommandCompletionException
-from aider.llm import litellm
-from aider.repo import ANY_GIT_ERROR
-from aider.run_cmd import run_cmd
-from aider.scrape import Scraper, install_playwright
-from aider.utils import is_image_file
-# Import event types from the new history module
-from aider.aider_history_redis import (
-    UserPromptEvent, AssistantMessageEvent, AddFileEvent, DropFileEvent,
-    LLMResponseEditEvent, ApplyEditEvent, UserRejectEditEvent, RunCommandEvent,
-    CommandOutputEvent, UserCommitEvent, ModeChangeEvent, SettingChangeEvent,
-    AddWebcontentEvent, PasteContentEvent, ClearHistoryEvent, ResetChatEvent
-)
-
-
-from .dump import dump  # noqa: F401
-
-
-class SwitchCoder(Exception):
-    def __init__(self, placeholder=None, **kwargs):
-        self.kwargs = kwargs
-        self.placeholder = placeholder
-
-
-class Commands:
-    voice = None
-    scraper = None
-
-    def clone(self):
-        # Ensure history_manager is handled correctly if cloning is used elsewhere
-        # For now, assume coder reference is updated after clone
-        return Commands(
-            self.io,
-            None, # Coder reference will be set later
-            voice_language=self.voice_language,
-            verify_ssl=self.verify_ssl,
-            args=self.args,
-            parser=self.parser,
-            verbose=self.verbose,
-            editor=self.editor,
-            original_read_only_fnames=self.original_read_only_fnames # Pass this along
-        )
-
-    def __init__(
-        self,
-        io,
-        coder, # Can be None initially
-        voice_language=None,
-        voice_input_device=None,
-        voice_format=None,
-        verify_ssl=True,
-        args=None,
-        parser=None,
-        verbose=False,
-        editor=None,
-        original_read_only_fnames=None,
-    ):
-        self.io = io
-        self.coder = coder # This will be set by main.py after Coder is created
-        self.parser = parser
-        self.args = args
-        self.verbose = verbose
-
-        self.verify_ssl = verify_ssl
-        if voice_language == "auto":
-            voice_language = None
-
-        self.voice_language = voice_language
-        self.voice_format = voice_format
-        self.voice_input_device = voice_input_device
-
-        self.help = None
-        self.editor = editor
-
-        # Store the original read-only filenames provided via args.read
-        self.original_read_only_fnames = set(original_read_only_fnames or [])
-
-    # ... (Helper methods like get_raw_completions, get_completions, get_commands, do_run, matching_commands, run remain similar) ...
-    def get_raw_completions(self, cmd):
-        assert cmd.startswith("/")
-        cmd = cmd[1:]
-        cmd = cmd.replace("-", "_")
-
-        raw_completer = getattr(self, f"completions_raw_{cmd}", None)
-        return raw_completer
-
-    def get_completions(self, cmd):
-        assert cmd.startswith("/")
-        cmd = cmd[1:]
-
-        cmd = cmd.replace("-", "_")
-        fun = getattr(self, f"completions_{cmd}", None)
-        if not fun:
-            return
-        return sorted(fun())
-
-    def get_commands(self):
-        commands = []
-        for attr in dir(self):
-            if not attr.startswith("cmd_"):
-                continue
-            cmd = attr[4:]
-            cmd = cmd.replace("_", "-")
-            commands.append("/" + cmd)
-
-        return commands
-
-    def do_run(self, cmd_name, args):
-        cmd_name = cmd_name.replace("-", "_")
-        cmd_method_name = f"cmd_{cmd_name}"
-        cmd_method = getattr(self, cmd_method_name, None)
-        if not cmd_method:
-            self.io.tool_output(f"Error: Command {cmd_name} not found.")
-            return
-
-        try:
-            return cmd_method(args)
-        except ANY_GIT_ERROR as err:
-            self.io.tool_error(f"Unable to complete {cmd_name}: {err}")
-
-    def matching_commands(self, inp):
-        words = inp.strip().split()
-        if not words:
-            return
-
-        first_word = words
-        rest_inp = inp[len(words) :].strip()
-
-        all_commands = self.get_commands()
-        matching_commands = [cmd for cmd in all_commands if cmd.startswith(first_word)]
-        return matching_commands, first_word, rest_inp
-
-    def run(self, inp):
-        if inp.startswith("!"):
-            # Log RunCommandEvent before executing
-            if self.coder and self.coder.history_manager:
-                self.coder.history_manager.add_event(RunCommandEvent(command=inp[1:]))
-            self.coder.event("command_run")
-            return self.do_run("run", inp[1:])
-
-        res = self.matching_commands(inp)
-        if res is None:
-            return
-        matching_commands, first_word, rest_inp = res
-        if len(matching_commands) == 1:
-            command = matching_commands[1:]
-            # Log command event before executing
-            if self.coder and self.coder.history_manager:
-                 # Log generic command event or specific if needed
-                 pass # Logging happens within specific cmd_ methods now
-            self.coder.event(f"command_{command}")
-            return self.do_run(command, rest_inp)
-        elif first_word in matching_commands:
-            command = first_word[1:]
-             # Log command event before executing
-            if self.coder and self.coder.history_manager:
-                 pass # Logging happens within specific cmd_ methods now
-            self.coder.event(f"command_{command}")
-            return self.do_run(command, rest_inp)
-        elif len(matching_commands) > 1:
-            self.io.tool_error(f"Ambiguous command: {', '.join(matching_commands)}")
-        else:
-            self.io.tool_error(f"Invalid command: {first_word}")
-
-
-    def cmd_model(self, args):
-        "Switch the Main Model to a new LLM"
-        model_name = args.strip()
-        # Log setting change before potentially raising SwitchCoder
-        if self.coder and self.coder.history_manager:
-            self.coder.history_manager.add_event(SettingChangeEvent(setting="main_model", value=model_name))
-
-        model = models.Model(
-            model_name,
-            editor_model=self.coder.main_model.editor_model.name,
-            weak_model=self.coder.main_model.weak_model.name,
-        )
-        models.sanity_check_models(self.io, model)
-
-        old_model_edit_format = self.coder.main_model.edit_format
-        current_edit_format = self.coder.edit_format
-        new_edit_format = current_edit_format
-        if current_edit_format == old_model_edit_format:
-            new_edit_format = model.edit_format
-
-        raise SwitchCoder(main_model=model, edit_format=new_edit_format)
-
-    def cmd_editor_model(self, args):
-        "Switch the Editor Model to a new LLM"
-        model_name = args.strip()
-        if self.coder and self.coder.history_manager:
-            self.coder.history_manager.add_event(SettingChangeEvent(setting="editor_model", value=model_name))
-
-        model = models.Model(
-            self.coder.main_model.name,
-            editor_model=model_name,
-            weak_model=self.coder.main_model.weak_model.name,
-        )
-        models.sanity_check_models(self.io, model)
-        raise SwitchCoder(main_model=model)
-
-    def cmd_weak_model(self, args):
-        "Switch the Weak Model to a new LLM"
-        model_name = args.strip()
-        if self.coder and self.coder.history_manager:
-            self.coder.history_manager.add_event(SettingChangeEvent(setting="weak_model", value=model_name))
-
-        model = models.Model(
-            self.coder.main_model.name,
-            editor_model=self.coder.main_model.editor_model.name,
-            weak_model=model_name,
-        )
-        models.sanity_check_models(self.io, model)
-        raise SwitchCoder(main_model=model)
-
-    def cmd_chat_mode(self, args):
-        "Switch to a new chat mode"
-        from aider import coders
-        ef = args.strip()
-        # ... (validation logic remains the same) ...
-        valid_formats = OrderedDict(...) # Keep validation logic
-        show_formats = OrderedDict(...) # Keep validation logic
-        if ef not in valid_formats and ef not in show_formats:
-             # ... (error reporting remains the same) ...
-             return
-
-        # Log mode change before raising SwitchCoder
-        if self.coder and self.coder.history_manager:
-             self.coder.history_manager.add_event(ModeChangeEvent(mode=ef))
-
-        # summarize_from_coder = True # Removed
-        edit_format = ef
-        if ef == "code":
-            edit_format = self.coder.main_model.edit_format
-            # summarize_from_coder = False # Removed
-        elif ef == "ask":
-            pass # summarize_from_coder = False # Removed
-
-        raise SwitchCoder(
-            edit_format=edit_format,
-            # summarize_from_coder=summarize_from_coder, # Removed
-        )
-
-    # ... (completions_model, cmd_models remain similar) ...
-    def completions_model(self):
-        models = litellm.model_cost.keys()
-        return models
-
-    def cmd_models(self, args):
-        "Search the list of available models"
-        args = args.strip()
-        if args:
-            models.print_matching_models(self.io, args)
-        else:
-            self.io.tool_output("Please provide a partial model name to search for.")
-
-
-    def cmd_web(self, args, return_content=False):
-        "Scrape a webpage, convert to markdown and send in a message"
-        url = args.strip()
-        if not url:
-            self.io.tool_error("Please provide a URL to scrape.")
-            return
-
-        self.io.tool_output(f"Scraping {url}...")
-        if not self.scraper:
-            res = install_playwright(self.io)
-            if not res:
-                self.io.tool_warning("Unable to initialize playwright.")
-            self.scraper = Scraper(
-                print_error=self.io.tool_error, playwright_available=res, verify_ssl=self.verify_ssl
-            )
-
-        content = self.scraper.scrape(url) or ""
-
-        # Log AddWebcontentEvent
-        if self.coder and self.coder.history_manager:
-             # Truncate content for logging if necessary
-             max_len = 1000
-             log_content = content
-             if len(content) > max_len:
-                  log_content = content[:max_len//2] + "\n...\n" + content[-max_len//2:]
-             self.coder.history_manager.add_event(AddWebcontentEvent(url=url, content=log_content))
-
-        full_content = f"Here is the content of {url}:\n\n" + content
-        if return_content:
-            return full_content
-
-        self.io.tool_output("... added to chat.")
-        # Removed adding to cur_messages, event is logged instead
-        # self.coder.cur_messages += [
-        #     dict(role="user", content=full_content),
-        #     dict(role="assistant", content="Ok."),
-        # ]
-
-
-    def cmd_commit(self, args=None):
-        "Commit edits to the repo made outside the chat (commit message optional)"
-        try:
-            self.raw_cmd_commit(args)
-        except ANY_GIT_ERROR as err:
-            self.io.tool_error(f"Unable to complete commit: {err}")
-
-    def raw_cmd_commit(self, args=None):
-        if not self.coder.repo:
-            self.io.tool_error("No git repository found.")
-            return
-
-        if not self.coder.repo.is_dirty():
-            self.io.tool_warning("No more changes to commit.")
-            return
-
-        commit_message = args.strip() if args else None
-        res = self.coder.repo.commit(message=commit_message) # Returns hash, msg on success
-
-        # Log UserCommitEvent on success
-        if res and self.coder and self.coder.history_manager:
-             commit_hash, final_message = res
-             self.coder.history_manager.add_event(UserCommitEvent(message=final_message))
-
-
-    def cmd_lint(self, args="", fnames=None):
-        "Lint and fix in-chat files or all dirty files if none in chat"
-        # ... (logic to determine fnames remains the same) ...
-        if not fnames:
-             self.io.tool_warning("No dirty files to lint.")
-             return
-
-        fnames = [self.coder.abs_root_path(fname) for fname in fnames]
-        lint_coder = None
-        for fname in fnames:
-             # ... (linting logic remains the same) ...
-             if not errors: continue
-             if not self.io.confirm_ask(...): continue
-
-             # Log lint command invocation (maybe before fixing?)
-             if self.coder and self.coder.history_manager:
-                  # Log which file is being linted/fixed
-                  rel_fname = self.coder.get_rel_fname(fname)
-                  # Maybe log the errors found too?
-                  self.coder.history_manager.add_event(RunCommandEvent(command=f"lint {rel_fname}"))
-
-
-             if self.coder.repo.is_dirty() and self.coder.dirty_commits:
-                  self.cmd_commit("") # This logs UserCommitEvent
-
-             if not lint_coder: lint_coder = self.coder.clone(...) # Clone logic needs review with history_manager
-
-             lint_coder.add_rel_fname(fname)
-             # The run call will trigger its own event logging
-             lint_coder.run(errors)
-             lint_coder.abs_fnames = set()
-
-        if lint_coder and self.coder.repo.is_dirty() and self.coder.auto_commits:
-            self.cmd_commit("") # This logs UserCommitEvent
-
-
-    def cmd_clear(self, args):
-        "Clear the chat history"
-        if self.coder and self.coder.history_manager:
-            self.coder.history_manager.clear_history()
-            # Optionally log the clear event itself *after* clearing
-            # self.coder.history_manager.add_event(ClearHistoryEvent())
-        else:
-             self.io.tool_error("History manager not available.")
-        # Removed direct manipulation of coder messages
-        # self._clear_chat_history()
-
-    # Removed _clear_chat_history method
-
-    def cmd_reset(self, args):
-        "Drop all files and clear the chat history"
-        # Log drop events for each file BEFORE dropping
-        if self.coder and self.coder.history_manager:
-             for fname in self.coder.abs_fnames:
-                  self.coder.history_manager.add_event(DropFileEvent(filepath=self.coder.get_rel_fname(fname)))
-             for fname in self.coder.abs_read_only_fnames:
-                  self.coder.history_manager.add_event(DropFileEvent(filepath=self.coder.get_rel_fname(fname)))
-
-        self._drop_all_files() # This modifies coder state directly
-
-        if self.coder and self.coder.history_manager:
-            self.coder.history_manager.reset_chat() # Clears Redis lists
-            # Optionally log the reset event itself *after* clearing
-            # self.coder.history_manager.add_event(ResetChatEvent())
-        else:
-             self.io.tool_error("History manager not available.")
-
-        self.io.tool_output("All files dropped and chat history cleared.")
-
-    # Removed _drop_all_files method (keep internal logic if needed elsewhere, but command logs events)
-
-    def cmd_tokens(self, args):
-        "Report on the number of tokens used by the current chat context"
-        # This command needs significant rework as history is now externalized.
-        # It could potentially fetch the history context and tokenize it,
-        # but it won't be able to break it down by message type easily without
-        # fetching and parsing the JSON history list.
-        # For now, provide a simplified version or indicate it needs updating.
-
-        self.io.tool_output("Token reporting needs update for Redis history.")
-        self.io.tool_output("Showing tokens for current files and repo map:")
-
-        res = []
-        # repo map
-        other_files = set(self.coder.get_all_abs_files()) - set(self.coder.abs_fnames)
-        if self.coder.repo_map:
-            repo_content = self.coder.repo_map.get_repo_map(self.coder.abs_fnames, other_files)
+    # --- Placeholder methods that need concrete implementation in subclasses ---
+    def get_edits(self):
+        """Placeholder: Subclasses must implement this to parse edits from LLM response."""
+        raise NotImplementedError
+
+    def apply_edits(self, edits):
+        """Placeholder: Subclasses must implement this to apply edits to files."""
+        raise NotImplementedError
+
+    def apply_edits_dry_run(self, edits):
+        """Placeholder: Subclasses must implement this for dry-run edit application."""
+        # Default implementation: return edits unchanged if no dry-run logic needed
+        return edits
+
+    def choose_fence(self):
+        """Placeholder: Subclasses might need to implement fence selection logic."""
+        # Default: Use standard triple backticks
+        self.fence = "```"
+
+    def fmt_system_prompt(self, prompt):
+        """Placeholder: Subclasses might format system prompts differently."""
+        return prompt # Default: return as is
+
+    def get_repo_messages(self):
+        """Placeholder: Subclasses might format repo context differently."""
+        if self.repo_map:
+            repo_content = self.repo_map.get_repo_map(self.get_inchat_relative_files(), self.abs_read_only_fnames)
             if repo_content:
-                tokens = self.coder.main_model.token_count(repo_content)
-                res.append((tokens, "repository map", "use --map-tokens to resize"))
+                return [dict(role="user", content=repo_content)]
+        return []
 
-        fence = "`" * 3
-        file_res = []
-        # files
-        for fname in self.coder.abs_fnames:
-            # ... (file token counting remains the same) ...
-            relative_fname = self.coder.get_rel_fname(fname)
+    def get_readonly_files_messages(self):
+        """Placeholder: Subclasses might format read-only files differently."""
+        # Default implementation (similar to original logic)
+        msgs = []
+        for fname in self.abs_read_only_fnames:
             content = self.io.read_text(fname)
-            if is_image_file(relative_fname):
-                tokens = self.coder.main_model.token_count_for_image(fname)
-            else:
-                content = f"{relative_fname}\n{fence}\n" + content + f"{fence}\n"
-                tokens = self.coder.main_model.token_count(content)
-            file_res.append((tokens, f"{relative_fname}", "/drop to remove"))
+            if content is None:
+                continue
+            rel_fname = self.get_rel_fname(fname)
+            content = f"{rel_fname}\n```\n{content}\n```\n"
+            msgs.append(dict(role="user", content=content))
+        return msgs
 
-        # read-only files
-        for fname in self.coder.abs_read_only_fnames:
-             # ... (file token counting remains the same) ...
-            relative_fname = self.coder.get_rel_fname(fname)
+    def get_chat_files_messages(self):
+        """Placeholder: Subclasses might format chat files differently."""
+        # Default implementation (similar to original logic)
+        msgs = []
+        for fname in self.abs_fnames:
             content = self.io.read_text(fname)
-            if content is not None and not is_image_file(relative_fname):
-                content = f"{relative_fname}\n{fence}\n" + content + f"{fence}\n"
-                tokens = self.coder.main_model.token_count(content)
-                file_res.append((tokens, f"{relative_fname} (read-only)", "/drop to remove"))
+            if content is None:
+                continue
+            rel_fname = self.get_rel_fname(fname)
+            content = f"{rel_fname}\n```\n{content}\n```\n"
+            msgs.append(dict(role="user", content=content))
+        return msgs
 
-
-        file_res.sort()
-        res.extend(file_res)
-
-        # ... (rest of token reporting formatting remains similar, but totals exclude history) ...
-        width = 8
-        cost_width = 9
-        def fmt(v): return format(int(v), ",").rjust(width)
-        col_width = max(len(row) for row in res) if res else 10
-        total = 0
-        total_cost = 0.0
-        for tk, msg, tip in res:
-            total += tk
-            cost = tk * (self.coder.main_model.info.get("input_cost_per_token") or 0)
-            total_cost += cost
-            msg = msg.ljust(col_width)
-            self.io.tool_output(f"${cost:7.4f} {fmt(tk)} {msg} {tip}")
-
-        self.io.tool_output("=" * (width + cost_width + 1))
-        self.io.tool_output(f"${total_cost:7.4f} {fmt(total)} tokens (excluding history)")
-        self.io.tool_output("History token count not included in this view.")
-
-
-    def cmd_undo(self, args):
-        "Undo the last git commit if it was done by aider"
-        # Log undo attempt before executing
-        if self.coder and self.coder.history_manager:
-             self.coder.history_manager.add_event(AGENT_COMMAND(name="/undo")) # Need AGENT_COMMAND event type
-
+    def check_tokens(self, messages):
+        """Placeholder: Subclasses might have specific token checks."""
+        # Default implementation (similar to original logic)
         try:
-            res = self.raw_cmd_undo(args) # raw_cmd_undo returns the reply message now
-            # If undo was successful and returned a message, log it as assistant reply
-            if res and self.coder and self.coder.history_manager:
-                 self.coder.history_manager.add_event(AssistantMessageEvent(content=res))
-        except ANY_GIT_ERROR as err:
-            self.io.tool_error(f"Unable to complete undo: {err}")
-            # Log error?
+            tokens = self.main_model.token_count(messages)
+        except Exception as e:
+            self.io.tool_error(f"Failed to count tokens: {e}")
+            return False
 
-    # ... (raw_cmd_undo remains mostly the same, but returns message) ...
-    def raw_cmd_undo(self, args):
-        # ... (checks remain the same) ...
-        if last_commit_hash not in self.coder.aider_commit_hashes:
-             # ... (error message) ...
-             return None # Indicate no action taken
+        if not tokens:
+            return False
 
-        # ... (checks remain the same) ...
+        max_tokens = self.main_model.info.get("max_input_tokens")
+        if not max_tokens:
+            return True
 
-        # Reset files
-        # ... (logic remains the same) ...
-        if unrestored:
-             # ... (error message) ...
-             return None # Indicate error
+        if tokens > max_tokens:
+            self.io.tool_error(f"Input is too large: {tokens} tokens, max is {max_tokens}")
+            return False
 
-        # Reset HEAD
-        self.coder.repo.repo.git.reset("--soft", "HEAD~1")
-        self.io.tool_output(f"Removed: {last_commit_hash} {last_commit_message}")
-        # ... (output current head) ...
+        return True
 
-        # Return the standard reply message
-        if self.coder.main_model.send_undo_reply:
-            return prompts.undo_command_reply
-        return None # Indicate success but no standard reply needed
-
-
-    # ... (cmd_diff, raw_cmd_diff remain similar, no history logging needed) ...
-    def cmd_diff(self, args=""):
-        # ... (implementation) ...
-        pass
-    def raw_cmd_diff(self, args=""):
-        # ... (implementation) ...
-        pass
-
-
-    # ... (completions_raw_read_only, completions_add remain similar) ...
-    def completions_raw_read_only(self, document, complete_event):
-        # ... (implementation) ...
-        pass
-    def completions_add(self):
-        # ... (implementation) ...
-        pass
-
-
-    def cmd_add(self, args):
-        "Add files to the chat so aider can edit them or review them in detail"
-        # ... (logic to find matched_files remains the same) ...
-        files_added_log = []
-        for matched_file in sorted(all_matched_files):
-            abs_file_path = self.coder.abs_root_path(matched_file)
-            # ... (checks remain the same) ...
-            if abs_file_path in self.coder.abs_fnames: continue
-            elif abs_file_path in self.coder.abs_read_only_fnames:
-                 # ... (logic to move from read-only) ...
-                 if self.coder.repo and self.coder.repo.path_in_repo(matched_file):
-                      self.coder.abs_read_only_fnames.remove(abs_file_path)
-                      self.coder.abs_fnames.add(abs_file_path)
-                      files_added_log.append(matched_file) # Log successful move
-                      self.io.tool_output(...)
-                 else: ...
-            else:
-                 # ... (checks for image support) ...
-                 content = self.io.read_text(abs_file_path)
-                 if content is None: ...
-                 else:
-                      self.coder.abs_fnames.add(abs_file_path)
-                      files_added_log.append(matched_file) # Log successful add
-                      fname = self.coder.get_rel_fname(abs_file_path)
-                      self.io.tool_output(f"Added {fname} to the chat")
-                      self.coder.check_added_files()
-
-        # Log events after processing all files
-        if self.coder and self.coder.history_manager:
-            for fname in files_added_log:
-                 rel_fname = self.coder.get_rel_fname(self.coder.abs_root_path(fname))
-                 self.coder.history_manager.add_event(AddFileEvent(filepath=rel_fname, read_only=False))
-
-
-    # ... (completions_drop remains similar) ...
-    def completions_drop(self):
-        # ... (implementation) ...
-        pass
-
-
-    def cmd_drop(self, args=""):
-        "Remove files from the chat session to free up context space"
-        # ... (logic to find files to drop remains similar) ...
-        files_dropped_log = []
-
-        if not args.strip():
-            # Log drop events for each file BEFORE dropping
-            if self.coder and self.coder.history_manager:
-                 for fname in self.coder.abs_fnames:
-                      files_dropped_log.append(self.coder.get_rel_fname(fname))
-                 for fname in self.coder.abs_read_only_fnames:
-                      files_dropped_log.append(self.coder.get_rel_fname(fname))
-            self._drop_all_files() # Modifies coder state
-            self.io.tool_output("Dropped all files...") # Inform user
-        else:
-            filenames = parse_quoted_filenames(args)
-            for word in filenames:
-                # ... (matching logic remains similar) ...
-                for matched_file in read_only_matched:
-                    self.coder.abs_read_only_fnames.remove(matched_file)
-                    files_dropped_log.append(self.coder.get_rel_fname(matched_file)) # Log drop
-                    self.io.tool_output(f"Removed read-only file {matched_file} from the chat")
-
-                for matched_file in matched_files:
-                    abs_fname = self.coder.abs_root_path(matched_file)
-                    if abs_fname in self.coder.abs_fnames:
-                        self.coder.abs_fnames.remove(abs_fname)
-                        files_dropped_log.append(matched_file) # Log drop
-                        self.io.tool_output(f"Removed {matched_file} from the chat")
-
-        # Log events after processing all files
-        if self.coder and self.coder.history_manager:
-             for fname in files_dropped_log:
-                  self.coder.history_manager.add_event(DropFileEvent(filepath=fname))
-
-
-    # ... (cmd_git remains similar, no history logging needed) ...
-    def cmd_git(self, args):
-        # ... (implementation) ...
-        pass
-
-
-    def cmd_test(self, args):
-        "Run a shell command and add the output to the chat on non-zero exit code"
-        if not args and self.coder.test_cmd:
-            args = self.coder.test_cmd
-        if not args: return
-
-        if not callable(args):
-            if type(args) is not str: raise ValueError(repr(args))
-            # Log RunCommandEvent before running
-            if self.coder and self.coder.history_manager:
-                 self.coder.history_manager.add_event(RunCommandEvent(command=args))
-            # cmd_run logs CommandOutputEvent internally if needed
-            return self.cmd_run(args, True)
-
-        # Handle callable test function (less common)
-        errors = args()
-        # Log callable test execution? Maybe as a simple RunCommandEvent?
-        if self.coder and self.coder.history_manager:
-             self.coder.history_manager.add_event(RunCommandEvent(command=f"callable_test: {args.__name__}"))
-             if errors:
-                  # Log output/errors from callable test?
-                  self.coder.history_manager.add_event(CommandOutputEvent(command=f"callable_test: {args.__name__}", output=errors[:1000], exit_status=1)) # Assume error status
-
-        if not errors: return
-        self.io.tool_output(errors)
-        return errors
-
-
-    def cmd_run(self, args, add_on_nonzero_exit=False):
-        "Run a shell command and optionally add the output to the chat (alias: !)"
-        # Log RunCommandEvent *before* execution (moved from Commands.run)
-        # Note: This might log twice if called via '!', but better than not logging.
-        # Consider adding a flag to prevent double logging if needed.
-        # if self.coder and self.coder.history_manager:
-        #      self.coder.history_manager.add_event(RunCommandEvent(command=args))
-
-        exit_status, combined_output = run_cmd(
-            args, verbose=self.verbose, error_print=self.io.tool_error, cwd=self.coder.root
-        )
-
-        if combined_output is None:
-            # Log command output event even if output is None (indicates failure)
-            if self.coder and self.coder.history_manager:
-                 self.coder.history_manager.add_event(CommandOutputEvent(command=args, output="Error: Command failed to produce output.", exit_status=exit_status or -1))
+    def warm_cache(self, chunks):
+        """Placeholder: Subclasses might implement cache warming differently."""
+        # Default implementation (similar to original logic)
+        if not self.ok_to_warm_cache:
+            return
+        if not self.add_cache_headers:
+            return
+        if not self.num_cache_warming_pings:
             return
 
-        token_count = self.coder.main_model.token_count(combined_output)
-        k_tokens = token_count / 1000
+        self.ok_to_warm_cache = False
 
-        add = False
-        if add_on_nonzero_exit:
-            add = exit_status != 0
-        else:
-            add = self.io.confirm_ask(f"Add {k_tokens:.1f}k tokens of command output to the chat?")
+        if self.cache_warming_thread and self.cache_warming_thread.is_alive():
+            return
 
-        # Log CommandOutputEvent regardless of whether it's added to chat context
-        if self.coder and self.coder.history_manager:
-             # Truncate for logging
-             max_len = 1000
-             log_output = combined_output
-             if len(combined_output) > max_len:
-                  log_output = combined_output[:max_len//2] + "\n...\n" + combined_output[-max_len//2:]
-             self.coder.history_manager.add_event(CommandOutputEvent(command=args, output=log_output, exit_status=exit_status))
-
-
-        if add:
-            num_lines = len(combined_output.strip().splitlines())
-            line_plural = "line" if num_lines == 1 else "lines"
-            self.io.tool_output(f"Added {num_lines} {line_plural} of output to the chat.")
-
-            # Format message for potential reflection, but don't add to history manager here
-            msg_content = prompts.run_output.format(
-                command=args,
-                output=combined_output,
-            )
-
-            # Removed adding to cur_messages
-            # self.coder.cur_messages += [
-            #     dict(role="user", content=msg_content),
-            #     dict(role="assistant", content="Ok."),
-            # ]
-
-            if add_on_nonzero_exit and exit_status != 0:
-                return msg_content # Return content for reflection
-            elif add and exit_status != 0:
-                self.io.placeholder = "What's wrong? Fix"
-
-        return None # Return None if output wasn't added or command succeeded
-
-
-    # ... (cmd_exit, cmd_quit, cmd_ls remain similar) ...
-    def cmd_exit(self, args): sys.exit()
-    def cmd_quit(self, args): self.cmd_exit(args)
-    def cmd_ls(self, args):
-        # ... (implementation) ...
-        pass
-
-    # ... (basic_help remains similar) ...
-    def basic_help(self):
-        # ... (implementation) ...
-        pass
-
-    def cmd_help(self, args):
-        "Ask questions about aider"
-        # ... (logic remains similar, but SwitchCoder needs to pass history_manager) ...
-        if not args.strip(): self.basic_help(); return
-
-        # ... (help initialization) ...
-
-        # Pass history_manager when cloning
-        coder = Coder.create(
-            io=self.io,
-            from_coder=self.coder,
-            edit_format="help",
-            # summarize_from_coder=False, # Removed
-            history_manager=self.coder.history_manager, # Pass manager
-            map_tokens=512,
-            map_mul_no_files=1,
+        self.cache_warming_thread = threading.Thread(
+            target=self.cache_warming_worker, args=(chunks,)
         )
-        # ... (rest of help logic) ...
-        coder.run(user_msg, preproc=False)
+        self.cache_warming_thread.daemon = True
+        self.cache_warming_thread.start()
 
-        raise SwitchCoder(
-            edit_format=self.coder.edit_format,
-            # summarize_from_coder=False, # Removed
-            from_coder=coder,
-            # ... (other args) ...
-            show_announcements=False,
-        )
-
-
-    # ... (completions_ask, _code, _architect, _context remain similar) ...
-    def completions_ask(self): raise CommandCompletionException()
-    def completions_code(self): raise CommandCompletionException()
-    def completions_architect(self): raise CommandCompletionException()
-    def completions_context(self): raise CommandCompletionException()
-
-
-    def cmd_ask(self, args):
-        """Ask questions about the code base without editing any files. If no prompt provided, switches to ask mode."""
-        return self._generic_chat_command(args, "ask")
-
-    def cmd_code(self, args):
-        """Ask for changes to your code. If no prompt provided, switches to code mode."""
-        return self._generic_chat_command(args, self.coder.main_model.edit_format)
-
-    def cmd_architect(self, args):
-        """Enter architect/editor mode using 2 different models. If no prompt provided, switches to architect/editor mode."""
-        return self._generic_chat_command(args, "architect")
-
-    def cmd_context(self, args):
-        """Enter context mode to see surrounding code context. If no prompt provided, switches to context mode."""
-        return self._generic_chat_command(args, "context", placeholder=args.strip() or None)
-
-    def _generic_chat_command(self, args, edit_format, placeholder=None):
-        # Log mode change *before* switching if no args provided
-        if not args.strip():
-            if self.coder and self.coder.history_manager:
-                 self.coder.history_manager.add_event(ModeChangeEvent(mode=edit_format))
-            return self.cmd_chat_mode(edit_format) # This raises SwitchCoder
-
-        # If args provided, switch happens temporarily
-        from aider.coders.base_coder import Coder
-        coder = Coder.create(
-            io=self.io,
-            from_coder=self.coder,
-            edit_format=edit_format,
-            # summarize_from_coder=False, # Removed
-            history_manager=self.coder.history_manager # Pass manager
-        )
-
-        user_msg = args
-        # The run call will log the UserPromptEvent
-        coder.run(user_msg)
-
-        # Switch back
-        raise SwitchCoder(
-            edit_format=self.coder.edit_format,
-            # summarize_from_coder=False, # Removed
-            from_coder=coder,
-            show_announcements=False,
-            placeholder=placeholder,
-        )
-
-    # ... (get_help_md remains similar) ...
-    def get_help_md(self):
-        # ... (implementation) ...
-        pass
-
-    def cmd_voice(self, args):
-        "Record and transcribe voice input"
-        # ... (voice logic remains same, result becomes placeholder) ...
-        if text:
-            self.io.placeholder = text # Let main loop handle logging UserPromptEvent
-
-
-    def cmd_paste(self, args):
-        """Paste image/text from the clipboard into the chat.\
-        Optionally provide a name for the image."""
-        try:
-            image = ImageGrab.grabclipboard()
-            if isinstance(image, Image.Image):
-                # ... (image handling logic remains same) ...
-                # Log PasteContentEvent for image
-                if self.coder and self.coder.history_manager:
-                     self.coder.history_manager.add_event(PasteContentEvent(
-                          type="image",
-                          name=basename,
-                          content=f"[IMAGE: {basename}]" # Placeholder content
-                     ))
-                # ... (add file to coder state) ...
+    def cache_warming_worker(self, chunks):
+        """Placeholder: Subclasses might implement cache warming worker differently."""
+        # Default implementation (similar to original logic)
+        for i in range(self.num_cache_warming_pings):
+            chunks.add_cache_control_headers()
+            messages = chunks.all_messages()
+            try:
+                _, completion = self.main_model.send_completion(
+                    messages,
+                    None,
+                    False,
+                    self.temperature,
+                )
+            except Exception:
                 return
 
-            text = pyperclip.paste()
-            if text:
-                self.io.tool_output(text)
-                # Log PasteContentEvent for text
-                if self.coder and self.coder.history_manager:
-                     self.coder.history_manager.add_event(PasteContentEvent(
-                          type="text",
-                          content=text[:500] # Log truncated text
-                     ))
-                return text # Return text to be processed as user input
+    def preproc_user_input(self, inp):
+        """Placeholder: Subclasses might preprocess user input differently."""
+        return inp # Default: return as is
 
-            self.io.tool_error("No image or text content found in clipboard.")
+    def reply_completed(self):
+        """Placeholder: Subclasses determine completion based on response."""
+        # Default: Assume completion if there's content or function call
+        return bool(self.partial_response_content or self.partial_response_function_call)
+
+    def keyboard_interrupt(self):
+        """Placeholder: Subclasses might handle interrupts differently."""
+        self.last_keyboard_interrupt = time.time()
+
+    def check_and_open_urls(self, err, description):
+        """Placeholder: Subclasses might handle URL opening differently."""
+        # Default implementation (similar to original logic)
+        if not self.detect_urls:
+            self.io.tool_error(str(err))
+            if description:
+                self.io.tool_error(description)
             return
 
-        except Exception as e:
-            self.io.tool_error(f"Error processing clipboard content: {e}")
+        urls_to_open = utils.find_urls(str(err))
+        if description:
+            urls_to_open += utils.find_urls(description)
 
+        urls_to_open = [url for url in urls_to_open if url not in self.rejected_urls]
 
-    def cmd_read_only(self, args):
-        "Add files to the chat that are for reference only, or turn added files to read-only"
-        files_added_log = []
-        files_converted_log = []
-
-        if not args.strip():
-            # Convert all files in chat to read-only
-            for fname in list(self.coder.abs_fnames):
-                self.coder.abs_fnames.remove(fname)
-                self.coder.abs_read_only_fnames.add(fname)
-                rel_fname = self.coder.get_rel_fname(fname)
-                files_converted_log.append(rel_fname) # Log conversion
-                self.io.tool_output(f"Converted {rel_fname} to read-only")
-        else:
-            filenames = parse_quoted_filenames(args)
-            all_paths = []
-            # ... (path expansion logic remains same) ...
-            for path in sorted(all_paths):
-                abs_path = self.coder.abs_root_path(path)
-                if os.path.isfile(abs_path):
-                    # _add_read_only_file logs the event now
-                    self._add_read_only_file(abs_path, path)
-                elif os.path.isdir(abs_path):
-                    # _add_read_only_directory logs events now
-                    self._add_read_only_directory(abs_path, path)
-                else:
-                    self.io.tool_error(f"Not a file or directory: {abs_path}")
-
-        # Log events (moved to helper methods)
-        # if self.coder and self.coder.history_manager:
-        #     for fname in files_added_log:
-        #         self.coder.history_manager.add_event(AddFileEvent(filepath=fname, read_only=True))
-        #     for fname in files_converted_log:
-        #         # Log conversion? Maybe as Drop + AddReadOnly? Or a new event type?
-        #         # For simplicity, log as AddFileEvent with read_only=True after removal
-        #         self.coder.history_manager.add_event(AddFileEvent(filepath=fname, read_only=True))
-
-
-    def _add_read_only_file(self, abs_path, original_name):
-        rel_fname = self.coder.get_rel_fname(abs_path)
-        event_logged = False
-        if is_image_file(original_name) and not self.coder.main_model.info.get("supports_vision"):
-            self.io.tool_error(...)
+        if not urls_to_open:
+            self.io.tool_error(str(err))
+            if description:
+                self.io.tool_error(description)
             return
 
-        if abs_path in self.coder.abs_read_only_fnames:
-            self.io.tool_error(f"{original_name} is already in the chat as a read-only file")
-            return
-        elif abs_path in self.coder.abs_fnames:
-            self.coder.abs_fnames.remove(abs_path)
-            self.coder.abs_read_only_fnames.add(abs_path)
-            # Log drop and add_readonly? Or just log the final state? Log final state.
-            if self.coder and self.coder.history_manager:
-                 self.coder.history_manager.add_event(DropFileEvent(filepath=rel_fname)) # Log removal first
-                 self.coder.history_manager.add_event(AddFileEvent(filepath=rel_fname, read_only=True))
-                 event_logged = True
-            self.io.tool_output(f"Moved {original_name} from editable to read-only files in the chat")
+        self.io.tool_error(str(err))
+        if description:
+            self.io.tool_error(description)
+
+        for url in urls_to_open:
+            if self.io.confirm_ask(f"Open URL {url} in browser?"):
+                utils.open_urls([url])
+            else:
+                self.rejected_urls.add(url)
+
+    def abs_root_path(self, path):
+        """Placeholder: Subclasses might handle path resolution differently."""
+        # Default implementation (similar to original logic)
+        if path in self.abs_root_path_cache:
+            return self.abs_root_path_cache[path]
+
+        res = Path(path)
+        if not res.is_absolute():
+            res = Path(self.root) / res
+
+        res = res.resolve()
+        self.abs_root_path_cache[path] = str(res)
+        return str(res)
+
+    def show_pretty(self):
+        """Placeholder: Subclasses might determine prettiness differently."""
+        return self.pretty # Default: use io setting
+
+    def lint_edited(self, edited):
+        """Placeholder: Subclasses might handle linting differently."""
+        # Default implementation (similar to original logic)
+        if not self.linter:
+            return None
+
+        edited_rel = [self.get_rel_fname(f) for f in edited]
+        lint_errors = self.linter.lint(edited_rel)
+        if lint_errors:
+            self.io.tool_output(lint_errors)
+            return lint_errors
         else:
-            self.coder.abs_read_only_fnames.add(abs_path)
-            if self.coder and self.coder.history_manager:
-                 self.coder.history_manager.add_event(AddFileEvent(filepath=rel_fname, read_only=True))
-                 event_logged = True
-            self.io.tool_output(f"Added {original_name} to read-only files.")
+            self.io.tool_output("No lint errors found.")
+            return None
 
-    def _add_read_only_directory(self, abs_path, original_name):
-        added_files_paths = []
-        for root, _, files in os.walk(abs_path):
-            for file in files:
-                file_path = os.path.join(root, file)
-                if (
-                    file_path not in self.coder.abs_fnames
-                    and file_path not in self.coder.abs_read_only_fnames
-                ):
-                    # Check image support before adding
-                    rel_file_path = self.coder.get_rel_fname(file_path)
-                    if is_image_file(rel_file_path) and not self.coder.main_model.info.get("supports_vision"):
-                         self.io.tool_error(f"Cannot add image file {rel_file_path}...")
-                         continue
-
-                    self.coder.abs_read_only_fnames.add(file_path)
-                    added_files_paths.append(rel_file_path)
-
-        # Log events after finding all files
-        if self.coder and self.coder.history_manager:
-             for rel_path in added_files_paths:
-                  self.coder.history_manager.add_event(AddFileEvent(filepath=rel_path, read_only=True))
-
-        if added_files_paths:
-            self.io.tool_output(
-                f"Added {len(added_files_paths)} files from directory {original_name} to read-only files."
-            )
-        else:
-            self.io.tool_output(f"No new files added from directory {original_name}.")
-
-
-    # ... (cmd_map, cmd_map_refresh, cmd_settings remain similar, no history logging needed) ...
-    def cmd_map(self, args):
-         # ... (implementation) ...
-         pass
-    def cmd_map_refresh(self, args):
-         # ... (implementation) ...
-         pass
-    def cmd_settings(self, args):
-         # ... (implementation) ...
-         pass
-
-
-    # ... (completions_raw_load, cmd_load remain similar, load replays events) ...
-    def completions_raw_load(self, document, complete_event):
-        return self.completions_raw_read_only(document, complete_event)
-
-    def cmd_load(self, args):
-        "Load and execute commands from a file"
-        # ... (file reading logic) ...
-        for cmd in commands:
-            # ... (skip comments/blanks) ...
-            self.io.tool_output(f"\nExecuting: {cmd}")
-            try:
-                # The run call will handle logging events for the loaded commands
-                self.run(cmd)
-            except SwitchCoder:
-                self.io.tool_error(...)
-
-
-    # ... (completions_raw_save, cmd_save remain similar, no history logging needed) ...
-    def completions_raw_save(self, document, complete_event):
-        return self.completions_raw_read_only(document, complete_event)
-    def cmd_save(self, args):
-        # ... (implementation) ...
-        pass
-
-
-    def cmd_multiline_mode(self, args):
-        "Toggle multiline mode (swaps behavior of Enter and Meta+Enter)"
-        self.io.toggle_multiline_mode()
-        # Log setting change
-        if self.coder and self.coder.history_manager:
-             mode_state = "on" if self.io.multiline_mode else "off"
-             self.coder.history_manager.add_event(SettingChangeEvent(setting="multiline_mode", value=mode_state))
-
-
-    # ... (cmd_copy, cmd_report remain similar, no history logging needed) ...
-    def cmd_copy(self, args):
-        # ... (implementation) ...
-        pass
-    def cmd_report(self, args):
-        # ... (implementation) ...
-        pass
-
-
-    # ... (cmd_editor, cmd_edit remain similar, result becomes user prompt logged elsewhere) ...
-    def cmd_editor(self, initial_content=""):
-        # ... (implementation) ...
-        pass
-    def cmd_edit(self, args=""):
-        return self.cmd_editor(args)
-
-
-    def cmd_think_tokens(self, args):
-        "Set the thinking token budget (supports formats like 8096, 8k, 10.5k, 0.5M)"
-        # ... (logic to set on model) ...
-        # Log setting change
-        if self.coder and self.coder.history_manager:
-             self.coder.history_manager.add_event(SettingChangeEvent(setting="think_tokens", value=args.strip()))
-        # ... (output announcements) ...
-
-
-    def cmd_reasoning_effort(self, args):
-        "Set the reasoning effort level (values: number or low/medium/high depending on model)"
-        # ... (logic to set on model) ...
-        # Log setting change
-        if self.coder and self.coder.history_manager:
-             self.coder.history_manager.add_event(SettingChangeEvent(setting="reasoning_effort", value=args.strip()))
-        # ... (output announcements) ...
-
-
-    # ... (cmd_copy_context remains similar, no history logging needed) ...
-    def cmd_copy_context(self, args=None):
-        # ... (implementation) ...
-        pass
-
-
-# ... (expand_subdir, parse_quoted_filenames, get_help_md, main remain similar) ...
-def expand_subdir(file_path): ...
-def parse_quoted_filenames(args): ...
-def get_help_md(): ...
-def main(): ...
-
-if __name__ == "__main__":
-    status = main()
-    sys.exit(status)
+    def show_exhausted_error(self):
+        """Placeholder: Subclasses might show exhaustion errors differently."""
+        # Default implementation (similar to original logic)
+        self.io.tool_error(
+            "The conversation history is too long for the configured context window."
+        )
+        self.io.tool_error(
+            f"Try running with a larger model, or with --history-max-tokens {self.main_model.info.get('max_input_tokens', 8192)//2} or smaller."
+        )
+        # Removed summarization hint
+        # self.io.tool_error("Or use /clear to clear the history.")
