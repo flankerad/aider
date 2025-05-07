@@ -448,6 +448,14 @@ class Coder:
         self.message_cost = 0
         # commit_before_message REMOVED
 
+    def check_added_files(self):
+        """
+        Perform any final checks or logging after files have been added to the chat.
+        This method can be overridden by subclasses for specific behaviors.
+        """
+        # Placeholder implementation. Add specific checks if needed.
+        pass
+
     def run_one(self, user_message, preproc):
         self.init_before_message()
 

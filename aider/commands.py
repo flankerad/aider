@@ -1387,17 +1387,21 @@ class Commands:
             return
 
         rel_path_for_log = self.coder.get_rel_fname(abs_path)
-        # Check if it was newly added or moved
-        was_editable = abs_path in self.coder.abs_fnames # Check before removing
-        
-        if abs_path in self.coder.abs_read_only_fnames: # Now it's read-only
-            if was_editable: # It was moved from editable
-                 if self.coder.history_manager: 
-                    self.coder.history_manager.add_event(DropFileEvent(filepath=rel_path_for_log)) # Log drop from editable
-                    self.coder.history_manager.add_event(AddFileEvent(filepath=rel_path_for_log, read_only=True))
-            else: # Newly added as read-only
-                if self.coder.history_manager:
-                    self.coder.history_manager.add_event(AddFileEvent(filepath=rel_path_for_log, read_only=True))
+
+        if abs_path in self.coder.abs_fnames:  # File was editable
+            self.coder.abs_fnames.remove(abs_path)
+            self.coder.abs_read_only_fnames.add(abs_path)
+            self.io.tool_output(f"Moved {original_name} to read-only in the chat.")
+            if self.coder.history_manager:
+                self.coder.history_manager.add_event(DropFileEvent(filepath=rel_path_for_log))
+                self.coder.history_manager.add_event(AddFileEvent(filepath=rel_path_for_log, read_only=True))
+        elif abs_path not in self.coder.abs_read_only_fnames:  # File is new to chat or was not read-only
+            self.coder.abs_read_only_fnames.add(abs_path)
+            self.io.tool_output(f"Added {original_name} as read-only to the chat.")
+            if self.coder.history_manager:
+                self.coder.history_manager.add_event(AddFileEvent(filepath=rel_path_for_log, read_only=True))
+        else: # File was already in abs_read_only_fnames
+            self.io.tool_output(f"{original_name} is already a read-only file in the chat.")
 
     def _add_read_only_directory(self, abs_path, original_name):
         added_files_paths = [] # Collect paths for logging

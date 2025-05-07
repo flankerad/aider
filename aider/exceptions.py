@@ -66,8 +66,18 @@ class LiteLLMExceptions:
                     raise ValueError(f"{var} is in litellm but not in aider's exceptions list")
 
         for var in self.exception_info:
-            ex = getattr(litellm, var)
-            self.exceptions[ex] = self.exception_info[var]
+            try:
+                ex_class = getattr(litellm, var)
+                self.exceptions[ex_class] = self.exception_info[var]
+            except AttributeError:
+                # This exception name, known to aider, is not found in litellm.
+                # This might happen if litellm removes/renames an error type.
+                # We'll print a warning and continue, so aider can still start.
+                # The obsolete error type will not have specific handling.
+                print(
+                    f"Warning: Aider-known exception type '{var}' not found in litellm."
+                    " It will be handled as a generic error if encountered."
+                )
 
     def exceptions_tuple(self):
         return tuple(self.exceptions)
@@ -105,3 +115,7 @@ class LiteLLMExceptions:
             # Fall through to default APIError handling if not the specific credits error
 
         return self.exceptions.get(ex.__class__, ExInfo(None, None, None))
+
+class CommandCompletionException(Exception):
+    """Raised when a command completion request is detected."""
+    pass

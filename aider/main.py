@@ -1069,7 +1069,7 @@ def main(argv=None, input=None, output=None, force_git_root=None, return_coder=F
             # This is a temporary measure; actual context will be built from real events.
             # A better approach might be for generate_llm_context to handle empty history gracefully.
             if not coder.history_manager.redis_client.lrange(coder.history_manager.text_list_key, 0, 0):
-                 coder.history_manager.add_event(UserPromptEvent(content="Show prompts (dummy event for context generation)"))
+                coder.history_manager.add_event(UserPromptEvent(content="Show prompts (dummy event for context generation)"))
         messages = coder.format_messages().all_messages() # format_messages now uses history_manager
         utils.show_messages(messages, functions=coder.functions)
         analytics.event("exit", reason="Showed prompts")
