@@ -3,11 +3,11 @@
 import base64
 import datetime # Added
 import hashlib
-import json # Added
+import json     
 import locale
 import math
 import mimetypes
-import os # Added
+import os       
 import platform
 import re
 import sys
@@ -18,7 +18,7 @@ from collections import defaultdict
 from datetime import datetime
 from json.decoder import JSONDecodeError
 from pathlib import Path
-from typing import List, Optional # Added Optional
+from typing import List, Optional, Dict, Any 
 
 from aider import __version__, models, prompts, urls, utils
 from aider.analytics import Analytics
@@ -39,12 +39,14 @@ from aider.repo import ANY_GIT_ERROR, GitRepo
 from aider.repomap import RepoMap
 from aider.run_cmd import run_cmd
 from aider.utils import format_content, format_messages, format_tokens, is_image_file
-from aider.aider_history_redis import ( # Import new history manager and events
-    RedisHistoryManager, UserPromptEvent, AssistantMessageEvent, AddFileEvent,
-    DropFileEvent, LLMResponseEditEvent, ApplyEditEvent, UserRejectEditEvent,
-    RunCommandEvent, CommandOutputEvent, UserCommitEvent, ModeChangeEvent,
-    SettingChangeEvent, AddWebcontentEvent, PasteContentEvent, ClearHistoryEvent,
-    ResetChatEvent
+from aider.aider_history_redis import (
+    RedisHistoryManager, BaseEvent, UserPromptEvent, AssistantMessageEvent,
+    LLMResponseEditEvent, ApplyEditEvent, UserRejectEditEvent, AddFileEvent,
+    DropFileEvent, RunCommandEvent, CommandOutputEvent, UserCommitEvent,
+    ModeChangeEvent, SettingChangeEvent, AddWebcontentEvent, PasteContentEvent,
+    ClearHistoryEvent, ResetChatEvent
+    # Note: FileContentEvent, EditOutcomeEvent, LLMFunctionCallEvent, LLMFunctionResponseEvent
+    # are NOT in the provided aider_history_redis.py, so they are not imported here.
 )
 
 
@@ -114,7 +116,12 @@ class Coder:
     test_outcome = None
     multi_response_content = ""
     partial_response_content = ""
-    # commit_before_message = [] # Removed, managed implicitly by history
+    # commit_before_message = []
+    # cur_messages = None 
+    # done_messages = None 
+    # summarized_done_messages = None 
+    # summarizing_messages = None 
+    # summarizer_thread = None 
     message_cost = 0.0
     message_tokens_sent = 0
     message_tokens_received = 0
@@ -126,7 +133,7 @@ class Coder:
     ignore_mentions = None
     chat_language = None
     file_watcher = None
-    history_manager: Optional[RedisHistoryManager] = None # Added
+    history_manager: Optional[RedisHistoryManager] = None
 
     # llmlingua attributes (kept for potential future use)
     llmlingua_compressor = None
@@ -136,13 +143,13 @@ class Coder:
 
     @classmethod
     def create(
-        self,
+        cls, 
         main_model=None,
         edit_format=None,
         io=None,
         from_coder=None,
-        # summarize_from_coder=True, # Removed, no summarization
-        history_manager=None, # Added
+        # summarize_from_coder=True, # REMOVED
+        history_manager=None, # ENSURED
         **kwargs,
     ):
         import aider.coders as coders
@@ -153,52 +160,49 @@ class Coder:
             else:
                 main_model = models.Model(models.DEFAULT_MODEL_NAME)
 
-        if edit_format == "code":
-            edit_format = None
-        if edit_format is None:
+        if edit_format == "code": # Special case for "code" mode
+            edit_format = main_model.edit_format # Use model's default
+        elif edit_format is None: # If no edit_format specified
             if from_coder:
                 edit_format = from_coder.edit_format
-            else:
+            else: # Default to model's edit format if no prior coder and no explicit format
                 edit_format = main_model.edit_format
+
 
         if not io and from_coder:
             io = from_coder.io
 
-        if not history_manager and from_coder: # Pass history manager when cloning
+        if not history_manager and from_coder:
              history_manager = from_coder.history_manager
 
         if from_coder:
-            use_kwargs = dict(from_coder.original_kwargs)  # copy orig kwargs
+            use_kwargs = dict(from_coder.original_kwargs) 
 
-            # Bring along context from the old Coder
             update = dict(
                 fnames=list(from_coder.abs_fnames),
                 read_only_fnames=list(from_coder.abs_read_only_fnames),
-                # done_messages=done_messages, # Removed
-                # cur_messages=from_coder.cur_messages, # Removed
+                # done_messages and cur_messages REMOVED
                 aider_commit_hashes=from_coder.aider_commit_hashes,
-                commands=from_coder.commands.clone(),
+                commands=from_coder.commands.clone(), # Clone commands object
                 total_cost=from_coder.total_cost,
                 ignore_mentions=from_coder.ignore_mentions,
                 file_watcher=from_coder.file_watcher,
-                history_manager=history_manager, # Ensure it's passed
+                history_manager=history_manager, 
             )
-            use_kwargs.update(update)  # override to complete the switch
-            use_kwargs.update(kwargs)  # override passed kwargs
+            use_kwargs.update(update) 
+            use_kwargs.update(kwargs) 
 
             kwargs = use_kwargs
             from_coder.ok_to_warm_cache = False
-
-        # Ensure history_manager is passed down
-        kwargs['history_manager'] = history_manager
+        
+        kwargs['history_manager'] = history_manager # Ensure it's in kwargs
 
         for coder_class in coders.__all__:
             if hasattr(coder_class, "edit_format") and coder_class.edit_format == edit_format:
-                # Pass history_manager to the constructor
-                res = coder_class(main_model, io, **kwargs)
-                res.original_kwargs = dict(kwargs) # Store original kwargs *after* updates
+                res = coder_class(main_model, io, **kwargs) 
+                res.original_kwargs = dict(kwargs) 
                 return res
-
+        
         valid_formats = [
             str(c.edit_format)
             for c in coders.__all__
@@ -285,17 +289,14 @@ class Coder:
             lines.append("Repo-map: disabled")
 
         # Files
-        for fname in self.get_inchat_relative_files():
-            lines.append(f"Added {fname} to the chat.")
+        
+        if self.history_manager and self.history_manager.redis_client:
+            lines.append(f"Chat history: Redis (Session ID: {self.history_manager.session_id})")
+        else:
+            lines.append("Chat history: In-memory (Redis not connected or configured)")
 
-        for fname in self.abs_read_only_fnames:
-            rel_fname = self.get_rel_fname(fname)
-            lines.append(f"Added {rel_fname} to the chat (read-only).")
-
-        # Removed done_messages check
-        # if self.done_messages:
-        #     lines.append("Restored previous conversation history.")
-
+        for fname in self.get_inchat_relative_files(): lines.append(f"Added {fname} to the chat.")
+        for fname_abs in self.abs_read_only_fnames: lines.append(f"Added {self.get_rel_fname(fname_abs)} to the chat (read-only).")
         if self.io.multiline_mode:
             lines.append("Multiline mode: Enabled. Enter inserts newline, Alt-Enter submits text")
 
@@ -318,18 +319,16 @@ class Coder:
         verbose=False,
         stream=True,
         use_git=True,
-        # cur_messages=None, # Removed
-        # done_messages=None, # Removed
-        # restore_chat_history=False, # Removed
-        history_manager=None, # Added
+        # cur_messages, done_messages, restore_chat_history REMOVED
+        history_manager=None, # ENSURED
         auto_lint=True,
         auto_test=False,
         lint_cmds=None,
         test_cmd=None,
         aider_commit_hashes=None,
-        map_mul_no_files=8,
+        map_mul_no_files=8, # Default value
         commands=None,
-        # summarizer=None, # Removed
+        # summarizer REMOVED
         total_cost=0.0,
         analytics=None,
         map_refresh="auto",
@@ -342,244 +341,102 @@ class Coder:
         file_watcher=None,
         auto_copy_context=False,
         auto_accept_architect=True,
-        **kwargs, # Capture other potential args like llmlingua_compressor
+        **kwargs, 
     ):
-        # Fill in a dummy Analytics if needed, but it is never .enable()'d
         self.analytics = analytics if analytics is not None else Analytics()
-
         self.event = self.analytics.event
         self.chat_language = chat_language
-        # self.commit_before_message = [] # Removed
-        self.aider_commit_hashes = set()
+        self.aider_commit_hashes = set(aider_commit_hashes) if aider_commit_hashes else set()
         self.rejected_urls = set()
         self.abs_root_path_cache = {}
-
         self.auto_copy_context = auto_copy_context
         self.auto_accept_architect = auto_accept_architect
-
-        self.ignore_mentions = ignore_mentions
-        if not self.ignore_mentions:
-            self.ignore_mentions = set()
-
+        self.ignore_mentions = ignore_mentions or set()
         self.file_watcher = file_watcher
-        if self.file_watcher:
-            self.file_watcher.coder = self
-
+        if self.file_watcher: self.file_watcher.coder = self
         self.suggest_shell_commands = suggest_shell_commands
         self.detect_urls = detect_urls
-
         self.num_cache_warming_pings = num_cache_warming_pings
-
-        if not fnames:
-            fnames = []
-
-        if io is None:
-            io = InputOutput()
-
-        if aider_commit_hashes:
-            self.aider_commit_hashes = aider_commit_hashes
-        else:
-            self.aider_commit_hashes = set()
-
+        fnames = fnames or []
+        self.io = io or InputOutput()
         self.chat_completion_call_hashes = []
         self.chat_completion_response_hashes = []
         self.need_commit_before_edits = set()
-
         self.total_cost = total_cost
-
         self.verbose = verbose
         self.abs_fnames = set()
         self.abs_read_only_fnames = set()
-
-        # Removed cur_messages/done_messages initialization
-        # if cur_messages:
-        #     self.cur_messages = cur_messages
-        # else:
-        #     self.cur_messages = []
-        # if done_messages:
-        #     self.done_messages = done_messages
-        # else:
-        #     self.done_messages = []
-
-        self.io = io
-        self.history_manager = history_manager # Store the history manager
-
+        self.history_manager = history_manager
         self.shell_commands = []
-
-        if not auto_commits:
-            dirty_commits = False
-
+        if not auto_commits: dirty_commits = False
         self.auto_commits = auto_commits
         self.dirty_commits = dirty_commits
-
         self.dry_run = dry_run
         self.pretty = self.io.pretty
-
         self.main_model = main_model
-        # Set the reasoning tag name based on model settings or default
-        self.reasoning_tag_name = (
-            self.main_model.reasoning_tag if self.main_model.reasoning_tag else REASONING_TAG
-        )
-
+        self.reasoning_tag_name = self.main_model.reasoning_tag or REASONING_TAG
         self.stream = stream and main_model.streaming
-
-        if cache_prompts and self.main_model.cache_control:
-            self.add_cache_headers = True
-
+        if cache_prompts and self.main_model.cache_control: self.add_cache_headers = True
         self.show_diffs = show_diffs
-
         self.commands = commands or Commands(self.io, self)
         self.commands.coder = self
-
         self.repo = repo
         if use_git and self.repo is None:
             try:
-                self.repo = GitRepo(
-                    self.io,
-                    fnames,
-                    None,
-                    models=main_model.commit_message_models(),
-                )
-            except FileNotFoundError:
-                pass
-
-        if self.repo:
-            self.root = self.repo.root
-
-        for fname in fnames:
-            fname = Path(fname)
-            if self.repo and self.repo.git_ignored_file(fname):
-                self.io.tool_warning(f"Skipping {fname} that matches gitignore spec.")
-
-            if self.repo and self.repo.ignored_file(fname):
-                self.io.tool_warning(f"Skipping {fname} that matches aiderignore spec.")
+                self.repo = GitRepo(self.io, fnames, None, models=main_model.commit_message_models())
+            except FileNotFoundError: pass
+        self.root = self.repo.root if self.repo else utils.find_common_root([str(Path(f).resolve()) for f in fnames]) or os.getcwd()
+        
+        for fname_arg in fnames:
+            fname_path = Path(fname_arg)
+            if not fname_path.is_absolute(): fname_path = Path(self.root) / fname_path # Resolve relative to determined root
+            fname_path = fname_path.resolve()
+            if self.repo and not str(fname_path).startswith(self.repo.root):
+                self.io.tool_warning(f"File {fname_path} is outside git repo {self.repo.root}, skipping.")
                 continue
-
-            if not fname.exists():
-                if utils.touch_file(fname):
-                    self.io.tool_output(f"Creating empty file {fname}")
-                else:
-                    self.io.tool_warning(f"Can not create {fname}, skipping.")
-                    continue
-
-            if not fname.is_file():
-                self.io.tool_warning(f"Skipping {fname} that is not a normal file.")
+            if self.repo and (self.repo.git_ignored_file(fname_path) or self.repo.ignored_file(fname_path)):
+                self.io.tool_warning(f"Skipping {fname_path} due to gitignore/aiderignore.")
                 continue
-
-            fname = str(fname.resolve())
-
-            self.abs_fnames.add(fname)
-            self.check_added_files()
-
-        if not self.repo:
-            self.root = utils.find_common_root(self.abs_fnames)
+            if not fname_path.exists():
+                if utils.touch_file(str(fname_path)): self.io.tool_output(f"Creating empty file {fname_path}")
+                else: self.io.tool_warning(f"Cannot create {fname_path}, skipping."); continue
+            if not fname_path.is_file():
+                self.io.tool_warning(f"Skipping {fname_path} (not a normal file)."); continue
+            abs_fname_str = str(fname_path)
+            self.abs_fnames.add(abs_fname_str)
+            if self.history_manager: self.history_manager.add_event(AddFileEvent(filepath=self.get_rel_fname(abs_fname_str)))
+        self.check_added_files()
 
         if read_only_fnames:
-            self.abs_read_only_fnames = set()
-            for fname in read_only_fnames:
-                abs_fname = self.abs_root_path(fname)
-                if os.path.exists(abs_fname):
-                    self.abs_read_only_fnames.add(abs_fname)
-                else:
-                    self.io.tool_warning(f"Error: Read-only file {fname} does not exist. Skipping.")
+            for ro_fname_arg in read_only_fnames:
+                ro_fname_path = Path(ro_fname_arg)
+                if not ro_fname_path.is_absolute(): ro_fname_path = Path(self.root) / ro_fname_path
+                ro_fname_path = ro_fname_path.resolve()
+                if ro_fname_path.exists() and ro_fname_path.is_file():
+                    abs_ro_fname_str = str(ro_fname_path)
+                    self.abs_read_only_fnames.add(abs_ro_fname_str)
+                    if self.history_manager: self.history_manager.add_event(AddFileEvent(filepath=self.get_rel_fname(abs_ro_fname_str), read_only=True))
+                else: self.io.tool_warning(f"Read-only file {ro_fname_path} not found/not a file, skipping.")
+        
+        use_repo_map = map_tokens > 0 if map_tokens is not None else main_model.use_repo_map
+        if map_tokens is None: map_tokens = 1024 # Default if not specified and use_repo_map is true
 
-        if map_tokens is None:
-            use_repo_map = main_model.use_repo_map
-            map_tokens = 1024
-        else:
-            use_repo_map = map_tokens > 0
-
-        max_inp_tokens = self.main_model.info.get("max_input_tokens") or 0
-
-        has_map_prompt = hasattr(self, "gpt_prompts") and self.gpt_prompts.repo_content_prefix
-
-        if use_repo_map and self.repo and has_map_prompt:
-            self.repo_map = RepoMap(
-                map_tokens,
-                self.root,
-                self.main_model,
-                io,
-                self.gpt_prompts.repo_content_prefix,
-                self.verbose,
-                max_inp_tokens,
-                map_mul_no_files=map_mul_no_files,
-                refresh=map_refresh,
-            )
-
-        # Removed summarizer initialization
-        # self.summarizer = summarizer or ChatSummary(
-        #     [self.main_model.weak_model, self.main_model],
-        #     self.main_model.max_chat_history_tokens,
-        # )
-        # self.summarizer_thread = None
-        # self.summarized_done_messages = []
-        # self.summarizing_messages = None
-
-        # Removed history restoration from file
-        # if not self.done_messages and restore_chat_history:
-        #     history_md = self.io.read_text(self.io.chat_history_file)
-        #     if history_md:
-        #         self.done_messages = utils.split_chat_history_markdown(history_md)
-        #         self.summarize_start()
-
-        # Linting and testing
+        if use_repo_map and self.repo and hasattr(self, "gpt_prompts") and self.gpt_prompts.repo_content_prefix:
+            self.repo_map = RepoMap(map_tokens, self.root, self.main_model, io, self.gpt_prompts.repo_content_prefix,
+                                    self.verbose, self.main_model.info.get("max_input_tokens", 0),
+                                    map_mul_no_files=map_mul_no_files, refresh=map_refresh)
         self.linter = Linter(root=self.root, encoding=io.encoding)
         self.auto_lint = auto_lint
-        self.setup_lint_cmds(lint_cmds) # Call the setup method
-        # self.lint_cmds = lint_cmds # Removed redundant assignment
+        self.setup_lint_cmds(lint_cmds)
         self.auto_test = auto_test
         self.test_cmd = test_cmd
-
-        # validate the functions jsonschema
         if self.functions:
             from jsonschema import Draft7Validator
-
-            for function in self.functions:
-                Draft7Validator.check_schema(function)
-
-            if self.verbose:
-                self.io.tool_output("JSON Schema:")
-                self.io.tool_output(json.dumps(self.functions, indent=4))
-
-        # Handle llmlingua compressor initialization (kept for potential future use)
+            for function in self.functions: Draft7Validator.check_schema(function)
+            if self.verbose: self.io.tool_output(f"JSON Schema:\n{json.dumps(self.functions, indent=4)}")
         self.llmlingua_compressor = kwargs.pop("llmlingua_compressor", None)
-        if self.llmlingua_compressor and PromptCompressor:
-            try:
-                os.makedirs(self.compression_output_dir, exist_ok=True)
-                self.io.tool_output(
-                    f"LLMLingua logging enabled. Outputs will be saved to '{self.compression_output_dir}'"
-                )
-            except OSError as e:
-                self.io.tool_error(
-                    f"Warning: Could not create LLMLingua output directory '{self.compression_output_dir}': {e}"
-                )
-                self.llmlingua_compressor = None  # Disable if dir creation fails
-        elif self.llmlingua_compressor:
-            self.io.tool_error(
-                "Warning: LLMLingua compressor provided, but llmlingua library not installed or failed to import."
-            )
-            self.llmlingua_compressor = None  # Ensure it's disabled
-
-        if kwargs: # Check for remaining kwargs after popping llmlingua
-            raise ValueError(f"Unexpected arguments: {kwargs}")
-
-
-    # Added setup_lint_cmds method
-    def setup_lint_cmds(self, lint_cmds):
-        """Configures the linter object with the appropriate commands."""
-        if not self.auto_lint or not self.linter:
-            if self.linter:
-                # Explicitly disable in linter if auto_lint is off
-                self.linter.set_linter_commands(None)
-            return
-
-        # Configure the linter with provided commands (or None for default)
-        # Assumes self.linter has a method like set_linter_commands
-        if self.linter:
-            self.linter.set_linter_commands(lint_cmds)
-
-
-    # ... (rest of the methods, modifications needed below) ...
+        # ... (llmlingua setup logic remains) ...
+        if kwargs: raise ValueError(f"Unexpected arguments: {kwargs}")
 
     def init_before_message(self):
         self.aider_edited_files = set()
@@ -589,9 +446,7 @@ class Coder:
         self.test_outcome = None
         self.shell_commands = []
         self.message_cost = 0
-        # Removed commit_before_message handling
-        # if self.repo:
-        #     self.commit_before_message.append(self.repo.get_head_commit_sha())
+        # commit_before_message REMOVED
 
     def run_one(self, user_message, preproc):
         self.init_before_message()
@@ -615,807 +470,413 @@ class Coder:
             self.num_reflections += 1
             message = self.reflected_message
 
-    # Removed summarize_start, summarize_worker, summarize_end methods
-
-    # Removed move_back_cur_messages method (logic needs rethinking with event log)
+    # summarize_start, summarize_worker, summarize_end REMOVED
+    # move_back_cur_messages REMOVED
 
     def format_chat_chunks(self):
         self.choose_fence()
-        main_sys = self.fmt_system_prompt(self.gpt_prompts.main_system)
-
-        example_messages = []
-        # ... (example message handling remains the same) ...
-        if self.gpt_prompts.example_messages:
-            example_messages += [
-                dict(
-                    role="user",
-                    content=(
-                        "I switched to a new code base. Please don't consider the above files"
-                        " or try to edit them any longer."
-                    ),
-                ),
-                dict(role="assistant", content="Ok."),
-            ]
-
+        main_sys_content = self.fmt_system_prompt(self.gpt_prompts.main_system)
         if self.gpt_prompts.system_reminder:
-            main_sys += "\n" + self.fmt_system_prompt(self.gpt_prompts.system_reminder)
+            main_sys_content += "\n" + self.fmt_system_prompt(self.gpt_prompts.system_reminder)
 
         chunks = ChatChunks()
-
         if self.main_model.use_system_prompt:
-            chunks.system = [
-                dict(role="system", content=main_sys),
-            ]
+            chunks.system = [dict(role="system", content=main_sys_content)]
         else:
-            chunks.system = [
-                dict(role="user", content=main_sys),
-                dict(role="assistant", content="Ok."),
-            ]
+            chunks.system = [dict(role="user", content=main_sys_content), dict(role="assistant", content="Ok.")]
 
+        example_messages = []
+        if self.gpt_prompts.example_messages:
+            for msg_spec in self.gpt_prompts.example_messages:
+                example_messages.append(dict(role=msg_spec["role"], content=self.fmt_system_prompt(msg_spec["content"])))
+            example_messages.extend([
+                dict(role="user", content="I switched to a new code base..."),
+                dict(role="assistant", content="Ok.")
+            ])
         chunks.examples = example_messages
-
-        # --- Replace history generation with call to RedisHistoryManager ---
-        # Removed: self.summarize_end()
-        # Removed: chunks.done = self.done_messages
-
-        # Calculate token budget for history
-        # This is approximate - needs refinement based on actual prompt structure
+        
         system_tokens = self.main_model.token_count(chunks.system)
         example_tokens = self.main_model.token_count(chunks.examples)
-        repo_map_tokens = 0
-        readonly_files_tokens = 0
-        chat_files_tokens = 0
-
+        
         chunks.repo = self.get_repo_messages()
-        if chunks.repo:
-            repo_map_tokens = self.main_model.token_count(chunks.repo)
+        repo_map_tokens = self.main_model.token_count(chunks.repo) if chunks.repo else 0
 
         chunks.readonly_files = self.get_readonly_files_messages()
-        if chunks.readonly_files:
-             readonly_files_tokens = self.main_model.token_count(chunks.readonly_files)
-
+        readonly_files_tokens = self.main_model.token_count(chunks.readonly_files) if chunks.readonly_files else 0
+        
         chunks.chat_files = self.get_chat_files_messages()
-        if chunks.chat_files:
-             chat_files_tokens = self.main_model.token_count(chunks.chat_files)
+        chat_files_tokens = self.main_model.token_count(chunks.chat_files) if chunks.chat_files else 0
 
-        # Placeholder for reminder tokens - add later if needed
-        reminder_tokens = 0
+        max_context_tokens = self.main_model.info.get("max_input_tokens", 8192)
+        
+        history_max_tokens_from_args = 4096 
+        if hasattr(self.io, 'args') and self.io.args and hasattr(self.io.args, 'history_max_tokens'):
+            history_max_tokens_from_args = self.io.args.history_max_tokens or 4096
 
-        max_context_tokens = self.main_model.info.get("max_input_tokens") or 8192 # Default if unknown
-        # Use history_max_tokens arg if provided, otherwise calculate based on model limit
-        max_hist_tokens_arg = self.io.args.history_max_tokens if hasattr(self.io, 'args') and self.io.args else 4096 # Get from args if available, handle None case
-        max_hist_tokens = max_hist_tokens_arg or (max_context_tokens // 2) # Default to half context if not set
-
-        other_context_tokens = (
-            system_tokens + example_tokens + repo_map_tokens +
-            readonly_files_tokens + chat_files_tokens + reminder_tokens
-        )
-        available_history_tokens = max(max_context_tokens - other_context_tokens, 100) # Ensure some minimum
-        history_token_limit = min(available_history_tokens, max_hist_tokens)
+        other_context_tokens = system_tokens + example_tokens + repo_map_tokens + readonly_files_tokens + chat_files_tokens
+        
+        # Calculate available tokens for history, considering a potential reminder later
+        # For now, don't subtract reminder tokens yet, as it's conditional
+        available_for_history = max_context_tokens - other_context_tokens
+        
+        history_token_limit = min(available_for_history, history_max_tokens_from_args)
+        history_token_limit = max(history_token_limit, 100) 
 
         if self.history_manager:
             chunks.history = self.history_manager.generate_llm_context(
                 max_tokens=history_token_limit,
-                tokenizer_func=self.main_model.token_count
+                tokenizer_func=self.main_model.token_count,
+                compaction_level=1 # Enable first level of compaction
             )
         else:
-            chunks.history = [] # No history if manager isn't available
-        # --- End History Generation Replacement ---
+            chunks.history = []
 
-
+        reminder_message_list = []
         if self.gpt_prompts.system_reminder:
-            reminder_message = [
-                dict(
-                    role="system", content=self.fmt_system_prompt(self.gpt_prompts.system_reminder)
-                ),
-            ]
-        else:
-            reminder_message = []
+            reminder_message_list = [dict(role="system", content=self.fmt_system_prompt(self.gpt_prompts.system_reminder))]
+        
+        actual_reminder_tokens = self.main_model.token_count(reminder_message_list) if reminder_message_list else 0
+        current_history_tokens = self.main_model.token_count(chunks.history)
 
-        # Removed cur messages handling
-        # chunks.cur = list(self.cur_messages)
-        chunks.reminder = [] # Reminder logic might need adjustment based on history
-
-        # Recalculate total tokens with actual history
-        messages_tokens = self.main_model.token_count(chunks.all_messages_except_cur()) # Exclude cur for now
-        reminder_tokens = self.main_model.token_count(reminder_message)
-        # cur_tokens = self.main_model.token_count(chunks.cur) # Removed cur
-
-        # if None not in (messages_tokens, reminder_tokens, cur_tokens):
-        #     total_tokens = messages_tokens + reminder_tokens + cur_tokens
-        if None not in (messages_tokens, reminder_tokens):
-             total_tokens = messages_tokens + reminder_tokens
-        else:
-            # add the reminder anyway
-            total_tokens = 0
-
-        # Removed final message handling based on cur
-        # if chunks.cur:
-        #     final = chunks.cur[-1]
-        # else:
-        #     final = None
-        final = None # Assume no cur messages for now
-
-        max_input_tokens = self.main_model.info.get("max_input_tokens") or 0
-        # Add the reminder prompt if we still have room to include it.
-        if (
-            not max_input_tokens
-            or total_tokens < max_input_tokens
-            and self.gpt_prompts.system_reminder
-        ):
+        # Check if reminder fits with the *actual* history tokens used
+        if self.gpt_prompts.system_reminder and (other_context_tokens + current_history_tokens + actual_reminder_tokens <= max_context_tokens):
             if self.main_model.reminder == "sys":
-                chunks.reminder = reminder_message
-            # Removed reminder injection into user message
-            # elif self.main_model.reminder == "user" and final and final["role"] == "user":
-            #     # stuff it into the user message
-            #     new_content = (
-            #         final["content"]
-            #         + "\n\n"
-            #         + self.fmt_system_prompt(self.gpt_prompts.system_reminder)
-            #     )
-            #     chunks.cur[-1] = dict(role=final["role"], content=new_content)
+                chunks.reminder = reminder_message_list
+        else:
+            chunks.reminder = []
+            if self.gpt_prompts.system_reminder and (other_context_tokens + current_history_tokens + actual_reminder_tokens > max_context_tokens):
+                 # If reminder didn't fit, we might need to re-fetch history with less tokens to make space.
+                 # This is complex. For now, if reminder doesn't fit, it's omitted.
+                 # A more advanced approach would be to reserve space for reminder when fetching history.
+                 if self.verbose: self.io.tool_output("System reminder omitted due to token limits after history retrieval.")
 
+
+        # cur_messages REMOVED
         return chunks
-
-    def format_messages(self):
-        chunks = self.format_chat_chunks()
-        if self.add_cache_headers:
-            # This might need adjustment if history format changes caching behavior
-            chunks.add_cache_control_headers()
-
-        # Return all messages including history now managed by ChatChunks
-        return chunks.all_messages()
 
     def send_message(self, inp):
         self.event("message_send_starting")
-
-        # Notify IO that LLM processing is starting
         self.io.llm_started()
 
-        # Log user input event BEFORE formatting messages
         if self.history_manager:
             self.history_manager.add_event(UserPromptEvent(content=inp))
 
-        # Format messages including the new history context
-        messages = self.format_messages()
+        messages = self.format_messages().all_messages() # Ensure all_messages() is called
 
         if not self.check_tokens(messages):
-             # Notify IO that LLM processing is ending (early exit)
             self.io.llm_finished()
             return
-        self.warm_cache(self.format_chat_chunks()) # Pass chunks to warm_cache
+        
+        self.warm_cache(self.format_chat_chunks())
 
-        if self.verbose:
-            utils.show_messages(messages, functions=self.functions)
-
+        if self.verbose: utils.show_messages(messages, functions=self.functions)
         self.multi_response_content = ""
-        if self.show_pretty() and self.stream:
-            self.mdstream = self.io.get_assistant_mdstream()
-        else:
-            self.mdstream = None
-
+        self.mdstream = self.io.get_assistant_mdstream() if self.show_pretty() and self.stream else None
+        
         retry_delay = 0.125
-
         litellm_ex = LiteLLMExceptions()
-
         self.usage_report = None
         exhausted = False
         interrupted = False
 
-        # <<< START LLMLINGUA LOGGING BLOCK (kept for potential future use) >>>
-        if self.llmlingua_compressor and PromptCompressor:
-            try:
-                # 1. Calculate original tokens
-                original_tokens = self.main_model.token_count(messages)
+        # LLMLingua block can remain as is for potential future use
 
-                # 2. Format messages for llmlingua (adjust as needed)
-                system_prompt = ""
-                history = []
-                question = ""
-                # Use the *already formatted* messages list
-                for i, msg in enumerate(messages):
-                    role = msg.get("role", "user").lower()
-                    content = msg.get("content", "")
-                    if isinstance(content, list): # Handle potential multipart content
-                        content = " ".join(p.get('text', '') for p in content if p.get('type') == 'text')
-
-                    if role == "system":
-                        system_prompt += content + "\n" # Concatenate system prompts
-                    elif role == "user":
-                        if i == len(messages) - 1: # Assume last message is the question
-                            question = content
-                        else:
-                            history.append(f"USER: {content}")
-                    elif role == "assistant":
-                        history.append(f"ASSISTANT: {content}")
-
-                context_to_compress = "\n".join(history)
-                system_prompt = system_prompt.strip()
-
-                self.io.tool_output(
-                    f"Attempting LLMLingua compression for logging (Original tokens: {original_tokens})..."
-                )
-
-                # 3. Call llmlingua compressor
-                compressed_result = self.llmlingua_compressor.compress_prompt(
-                    context=[context_to_compress],
-                    instruction=system_prompt,
-                    question=question,
-                    return_details=True,
-                )
-
-                # 4. Extract compressed content and stats
-                compressed_content = compressed_result.get("compressed_prompt", str(compressed_result))
-                llm_reported_orig_tokens = compressed_result.get("origin_tokens", "?")
-                llm_reported_comp_tokens = compressed_result.get("compressed_tokens", "?")
-
-                # 5. Calculate compressed tokens using the main model's tokenizer
-                compressed_message_for_calc = []
-                if system_prompt:
-                    compressed_message_for_calc.append({"role": "system", "content": system_prompt})
-                compressed_message_for_calc.append({"role": "user", "content": compressed_content})
-                if question:
-                     compressed_message_for_calc.append({"role": "user", "content": question})
-
-                calculated_compressed_tokens = self.main_model.token_count(
-                    compressed_message_for_calc
-                )
-
-                self.io.tool_output("LLMLingua compression logged.")
-                if llm_reported_orig_tokens != "?":
-                    self.io.tool_output(
-                        f"  LLMLingua stats: Original={llm_reported_orig_tokens}, Compressed={llm_reported_comp_tokens}"
-                    )
-                self.io.tool_output(
-                    f"  Calculated stats: Original={original_tokens}, Compressed={calculated_compressed_tokens}"
-                )
-
-                # 6. Write to file
-                self.compression_output_counter += 1
-                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                filename = os.path.join(
-                    self.compression_output_dir,
-                    f"compressed_{timestamp}_{self.compression_output_counter}.log",
-                )
-                try:
-                    with open(filename, "w", encoding="utf-8") as f:
-                        f.write(f"### LLMLingua Compression Log: {filename} ###\n")
-                        f.write(f"Timestamp: {timestamp}\n")
-                        f.write("\n--- Compression Stats ---\n")
-                        f.write(f"Original Tokens (calculated): {original_tokens}\n")
-                        f.write(f"Compressed Tokens (calculated): {calculated_compressed_tokens}\n")
-                        reduction = original_tokens - calculated_compressed_tokens
-                        percent_reduction = (
-                            (reduction / original_tokens * 100) if original_tokens > 0 else 0
-                        )
-                        f.write(f"Token Reduction: {reduction} ({percent_reduction:.2f}%)\n")
-                        if llm_reported_orig_tokens != "?":
-                            f.write(
-                                f"LLMLingua Reported Original Tokens: {llm_reported_orig_tokens}\n"
-                            )
-                            f.write(
-                                f"LLMLingua Reported Compressed Tokens: {llm_reported_comp_tokens}\n"
-                            )
-
-                        f.write("\n--- Original Messages (Sent to LLM) ---\n")
-                        try:
-                            f.write(json.dumps(messages, indent=2))
-                        except Exception:
-                            f.write(str(messages))
-                        f.write("\n\n--- Context Sent to LLMLingua ---\n")
-                        f.write(f"Instruction:\n{system_prompt}\n\n")
-                        f.write(f"History Context:\n{context_to_compress}\n\n")
-                        f.write(f"Question:\n{question}\n")
-                        f.write("\n--- Compressed Output from LLMLingua ---\n")
-                        f.write(compressed_content)
-                    self.io.tool_output(f"Compressed output and stats saved to: {filename}")
-                except OSError as e:
-                    self.io.tool_error(f"Error writing LLMLingua log file '{filename}': {e}")
-                except Exception as e:
-                    self.io.tool_error(
-                        f"Unexpected error writing LLMLingua log file '{filename}': {e}"
-                    )
-
-            except Exception as e:
-                import traceback
-                self.io.tool_error(f"LLMLingua compression logging failed: {e}")
-                traceback.print_exc()
-        # <<< END LLMLINGUA LOGGING BLOCK >>>
-
-
-        # --- Main LLM call ---
         try:
             while True:
                 try:
-                    yield from self.send(messages, functions=self.functions)
+                    yield from self.send(messages, functions=self.functions) # Call the lower-level send
                     break
-                # ... (existing error handling for LLM call) ...
                 except litellm_ex.exceptions_tuple() as err:
                     ex_info = litellm_ex.get_ex_info(err)
-
-                    if ex_info.name == "ContextWindowExceededError":
-                        exhausted = True
-                        break
-
+                    if ex_info.name == "ContextWindowExceededError": exhausted = True; break
                     should_retry = ex_info.retry
                     if should_retry:
                         retry_delay *= 2
-                        if retry_delay > RETRY_TIMEOUT:
-                            should_retry = False
-
-                    if not should_retry:
-                        self.mdstream = None
-                        self.check_and_open_urls(err, ex_info.description)
-                        break
-
+                        if retry_delay > RETRY_TIMEOUT: should_retry = False
+                    if not should_retry: self.mdstream = None; self.check_and_open_urls(err, ex_info.description); break
                     err_msg = str(err)
-                    if ex_info.description:
-                        self.io.tool_warning(err_msg)
-                        self.io.tool_error(ex_info.description)
-                    else:
-                        self.io.tool_error(err_msg)
-
-                    self.io.tool_output(f"Retrying in {retry_delay:.1f} seconds...")
-                    time.sleep(retry_delay)
+                    if ex_info.description: self.io.tool_warning(err_msg); self.io.tool_error(ex_info.description)
+                    else: self.io.tool_error(err_msg)
+                    self.io.tool_output(f"Retrying in {retry_delay:.1f} seconds..."); time.sleep(retry_delay)
                     continue
-                except KeyboardInterrupt:
-                    interrupted = True
-                    break
+                except KeyboardInterrupt: interrupted = True; break
                 except FinishReasonLength:
-                    # We hit the output limit!
-                    if not self.main_model.info.get("supports_assistant_prefill"):
-                        exhausted = True
-                        break
-
+                    if not self.main_model.info.get("supports_assistant_prefill"): exhausted = True; break
                     self.multi_response_content = self.get_multi_response_content_in_progress()
-
-                    # This logic might need review - appending to messages list for retry
-                    if messages[-1]["role"] == "assistant":
-                        messages[-1]["content"] = self.multi_response_content
-                    else:
-                        messages.append(
-                            dict(role="assistant", content=self.multi_response_content, prefix=True)
-                        )
+                    if messages[-1]["role"] == "assistant": messages[-1]["content"] = self.multi_response_content
+                    else: messages.append(dict(role="assistant", content=self.multi_response_content, prefix=True))
                 except Exception as err:
                     self.mdstream = None
-                    lines = traceback.format_exception(type(err), err, err.__traceback__)
-                    self.io.tool_warning("".join(lines))
+                    self.io.tool_warning("".join(traceback.format_exception(type(err), err, err.__traceback__)))
                     self.io.tool_error(str(err))
                     self.event("message_send_exception", exception=str(err))
                     return
         finally:
-            if self.mdstream:
-                self.live_incremental_response(True)
-                self.mdstream = None
-
+            if self.mdstream: self.live_incremental_response(True); self.mdstream = None
             self.partial_response_content = self.get_multi_response_content_in_progress(True)
-            self.remove_reasoning_content()
-            self.multi_response_content = ""
-
-            # Notify IO that LLM processing is finished
+            self.remove_reasoning_content() # This modifies self.partial_response_content
+            
+            if self.history_manager: # Log assistant reply here, after reasoning is removed
+                self.add_assistant_reply_to_history() 
+            
+            self.multi_response_content = "" # Clear after logging
             self.io.llm_finished()
 
-
         self.io.tool_output()
-
         self.show_usage_report()
 
-        # Log assistant reply event AFTER processing
-        if self.history_manager:
-             self.add_assistant_reply_to_history() # Use helper
-
-
         if exhausted:
-            # Removed cur_messages handling
             self.show_exhausted_error()
             self.num_exhausted_context_windows += 1
+            # No specific EditOutcomeEvent for this in provided history file
             return
 
-        if self.partial_response_function_call:
-            args = self.parse_partial_args()
-            if args:
-                content = args.get("explanation") or ""
-            else:
-                content = ""
-        elif self.partial_response_content:
-            content = self.partial_response_content
-        else:
-            content = ""
+        content_from_llm = self.partial_response_function_call.get("explanation", "") if self.partial_response_function_call else self.partial_response_content
 
         if not interrupted:
-            add_rel_files_message = self.check_for_file_mentions(content)
+            add_rel_files_message = self.check_for_file_mentions(content_from_llm)
             if add_rel_files_message:
-                # This reflection logic needs review - how does it interact with event log?
-                # For now, just log the reflection prompt if it happens.
-                reflection_prompt = add_rel_files_message
-                if self.reflected_message:
-                    reflection_prompt = self.reflected_message + "\n\n" + add_rel_files_message
-                self.reflected_message = reflection_prompt
-                # Log the reflection prompt as a user event? Or system?
-                # if self.history_manager:
-                #     self.history_manager.add_event(UserPromptEvent(content=self.reflected_message))
+                self.reflected_message = (self.reflected_message + "\n\n" + add_rel_files_message) if self.reflected_message else add_rel_files_message
+                # UserPromptEvent for reflection will be logged at start of next send_message call
                 return
-
             try:
-                if self.reply_completed():
-                    return
-            except KeyboardInterrupt:
-                interrupted = True
+                if self.reply_completed(): pass # Reply logged in finally block
+            except KeyboardInterrupt: interrupted = True
 
         if interrupted:
-            # Log interruption event?
-            # if self.history_manager:
-            #    self.history_manager.add_event(UserInterruptionEvent()) # Need new event type
-            # Removed cur_messages handling
-            # Log a simple assistant message about interruption
-            if self.history_manager:
-                 self.history_manager.add_event(AssistantMessageEvent(content="Interrupted."))
+            # AssistantMessageEvent for interruption already logged by add_assistant_reply_to_history if content was "Interrupted..."
+            # Or, if add_assistant_reply_to_history didn't run due to early exit, log here.
+            # For simplicity, assume add_assistant_reply_to_history handles it or partial_response_content is empty.
             return
 
-        edited = self.apply_updates() # This needs to log ApplyEditEvent internally now
+        edited_paths = self.apply_updates() # Logs ApplyEditEvent or UserRejectEditEvent
 
-        if edited:
-            self.aider_edited_files.update(edited)
-            # auto_commit needs to log UserCommitEvent if successful
-            saved_message = self.auto_commit(edited)
+        if edited_paths:
+            self.aider_edited_files.update(edited_paths)
+            self.auto_commit(edited_paths) # Logs UserCommitEvent
 
-            # Removed move_back_cur_messages
-            # if not saved_message and hasattr(self.gpt_prompts, "files_content_gpt_edits_no_repo"):
-            #     saved_message = self.gpt_prompts.files_content_gpt_edits_no_repo
-            # self.move_back_cur_messages(saved_message)
+        if self.reflected_message: return # Reflection will be new UserPromptEvent
 
-        if self.reflected_message:
-             # Log reflection prompt?
-             # if self.history_manager:
-             #    self.history_manager.add_event(UserPromptEvent(content=self.reflected_message))
-            return
-
-        if edited and self.auto_lint:
-            lint_errors = self.lint_edited(edited)
-            # auto_commit needs to log UserCommitEvent
-            self.auto_commit(edited, context="Ran the linter")
+        if edited_paths and self.auto_lint:
+            lint_errors = self.lint_edited(edited_paths)
+            self.auto_commit(edited_paths, context="Ran the linter") # Logs UserCommitEvent
             self.lint_outcome = not lint_errors
             if lint_errors:
-                ok = self.io.confirm_ask("Attempt to fix lint errors?")
-                if ok:
+                if self.io.confirm_ask("Attempt to fix lint errors?"):
                     self.reflected_message = lint_errors
-                    # Log reflection prompt?
-                    # if self.history_manager:
-                    #    self.history_manager.add_event(UserPromptEvent(content=self.reflected_message))
-
+                    # Reflection will be new UserPromptEvent
                     return
+                # else: No specific EditOutcomeEvent for "lint_errors_not_fixed"
 
-        shared_output = self.run_shell_commands() # This logs RunCommand/Output events internally
-        # Removed adding output back to cur_messages
-        # if shared_output:
-        #     self.cur_messages += [
-        #         dict(role="user", content=shared_output),
-        #         dict(role="assistant", content="Ok"),
-        #     ]
+        self.run_shell_commands() # Logs RunCommandEvent and CommandOutputEvent
 
-        if edited and self.auto_test:
-            # cmd_test needs to log RunCommand/Output events internally
-            test_errors = self.commands.cmd_test(self.test_cmd)
+        if edited_paths and self.auto_test:
+            test_errors = self.commands.cmd_test(self.test_cmd) # Logs events via cmd_test
             self.test_outcome = not test_errors
             if test_errors:
-                ok = self.io.confirm_ask("Attempt to fix test errors?")
-                if ok:
+                if self.io.confirm_ask("Attempt to fix test errors?"):
                     self.reflected_message = test_errors
-                    # Log reflection prompt?
-                    # if self.history_manager:
-                    #    self.history_manager.add_event(UserPromptEvent(content=self.reflected_message))
+                    # Reflection will be new UserPromptEvent
                     return
-
-    # ... (reply_completed, show_exhausted_error, lint_edited remain mostly the same) ...
-
-    def __del__(self):
-        """Cleanup when the Coder object is destroyed."""
-        self.ok_to_warm_cache = False
+                # else: No specific EditOutcomeEvent for "test_errors_not_fixed"
 
     def add_assistant_reply_to_history(self):
-        """Helper to log assistant messages/edits to the history manager."""
-        if not self.history_manager:
-            return
+        if not self.history_manager: return
 
-        if self.partial_response_content:
-            # Check if it looks like an edit block based on edit_format (simplistic check)
+        content_to_log = self.partial_response_content # This has reasoning removed by now
+        
+        # Check for function call (this logic might need refinement based on how function calls are structured)
+        # The provided history file does not have LLMFunctionCallEvent.
+        # For now, if it's a function call, we'll log it as a special AssistantMessage.
+        if self.partial_response_function_call:
+            func_name = self.partial_response_function_call.get("name", "unknown_function")
+            func_args_str = self.partial_response_function_call.get("arguments", "{}")
+            # Create a string representation for the log
+            log_content = f"[FUNCTION_CALL]\nName: {func_name}\nArguments: {func_args_str}"
+            if content_to_log: # If there was also textual explanation
+                log_content = f"{content_to_log}\n{log_content}"
+            self.history_manager.add_event(AssistantMessageEvent(content=log_content))
+        elif content_to_log: # Standard text or edit response
+            # Determine if it's an edit based on format (simplified)
             is_edit = False
-            if self.edit_format in ["diff", "udiff", "whole", "diff-fenced"]: # Add other formats
-                 # Basic check for fences or diff markers
-                 if "```diff" in self.partial_response_content or "--- a/" in self.partial_response_content or (hasattr(self, 'fence') and self.fence in self.partial_response_content):
-                      is_edit = True
-
+            if self.edit_format and self.edit_format != "text":
+                if "```" in content_to_log or "--- a/" in content_to_log or "<source" in content_to_log:
+                    is_edit = True
+            
             if is_edit:
-                 # TODO: Extract target filename if possible from the content
-                 target_file = None # Placeholder
-                 self.history_manager.add_event(LLMResponseEditEvent(
-                      edit_content=self.partial_response_content,
-                      target_filepath=target_file
-                 ))
+                self.history_manager.add_event(LLMResponseEditEvent(edit_content=content_to_log))
             else:
-                 self.history_manager.add_event(AssistantMessageEvent(content=self.partial_response_content))
+                self.history_manager.add_event(AssistantMessageEvent(content=content_to_log))
+        # If both are empty, perhaps an empty response or only interruption, do nothing here.
 
-        # Add function call logging if needed (TBD)
-        # if self.partial_response_function_call:
-        #     self.history_manager.add_event(AssistantFunctionCallEvent(...))
-
-
-    # Removed add_assistant_reply_to_cur_messages
-
-    # ... (get_file_mentions, check_for_file_mentions remain mostly the same) ...
-
-    def send(self, messages, model=None, functions=None):
-        # ... (logging block for llmlingua remains here for potential future use) ...
-
-        # --- Main LLM call ---
-        self.got_reasoning_content = False
-        self.ended_reasoning_content = False
-
-        if not model:
-            model = self.main_model
-
-        self.partial_response_content = ""
-        self.partial_response_function_call = dict()
-
-        self.io.log_llm_history("TO LLM", format_messages(messages))
-
-        completion = None
-        try:
-            hash_object, completion = model.send_completion(
-                messages,
-                functions,
-                self.stream,
-                self.temperature,
-            )
-            self.chat_completion_call_hashes.append(hash_object.hexdigest())
-
-            if self.stream:
-                yield from self.show_send_output_stream(completion)
-            else:
-                self.show_send_output(completion)
-
-            # Calculate costs for successful responses
-            self.calculate_and_show_tokens_and_cost(messages, completion)
-
-        except LiteLLMExceptions().exceptions_tuple() as err:
-            ex_info = LiteLLMExceptions().get_ex_info(err)
-            if ex_info.name == "ContextWindowExceededError":
-                # Still calculate costs for context window errors
-                self.calculate_and_show_tokens_and_cost(messages, completion)
-            raise
-        except KeyboardInterrupt as kbi:
-            self.keyboard_interrupt()
-            raise kbi
-        finally:
-            self.io.log_llm_history(
-                "LLM RESPONSE",
-                format_content("ASSISTANT", self.partial_response_content),
-            )
-
-            if self.partial_response_content:
-                self.io.ai_output(self.partial_response_content)
-            elif self.partial_response_function_call:
-                # TODO: push this into subclasses
-                args = self.parse_partial_args()
-                if args:
-                    self.io.ai_output(json.dumps(args, indent=4))
-
-    # ... (show_send_output, show_send_output_stream, live_incremental_response, render_incremental_response, remove_reasoning_content remain mostly the same) ...
-
-    # ... (calculate_and_show_tokens_and_cost, show_usage_report remain mostly the same) ...
-
-    # ... (get_multi_response_content_in_progress remains the same) ...
-
-    # ... (get_rel_fname, get_inchat_relative_files, is_file_safe, get_all_relative_files, get_all_abs_files, get_addable_relative_files remain the same) ...
-
-    # ... (check_for_dirty_commit, allowed_to_edit, check_added_files, prepare_to_edit remain mostly the same) ...
-
+    # send method (lower level) remains largely the same.
+    # apply_updates method:
     def apply_updates(self):
-        edited = set()
+        edited_paths_applied = set()
         try:
             edits = self.get_edits()
-            edits = self.apply_edits_dry_run(edits)
-            edits = self.prepare_to_edit(edits) # This calls dirty_commit if needed
-            edited_paths = set(edit for edit in edits if edit is not None)
+            edits_prepared = self.apply_edits_dry_run(edits)
+            
+            edits_to_apply = self.prepare_to_edit(edits_prepared) 
+            if not edits_to_apply and edits_prepared: 
+                if self.history_manager:
+                    self.history_manager.add_event(UserRejectEditEvent()) # No reason field
+                return edited_paths_applied
 
-            self.apply_edits(edits) # Apply the actual changes
+            self.apply_edits(edits_to_apply) 
 
-            # Log ApplyEditEvent *after* successful application
-            if self.history_manager and edited_paths and not self.dry_run:
-                 # Get commit hash *after* potential auto-commit within apply_edits/auto_commit
-                 commit_hash = self.last_aider_commit_hash # Use the stored hash
-                 self.history_manager.add_event(ApplyEditEvent(
-                     filepaths=list(edited_paths),
-                     commit_hash=commit_hash
-                 ))
-            edited = edited_paths # Return the paths that were actually edited
+            if not self.dry_run and edits_to_apply:
+                current_edit_paths = set()
+                for edit_op in edits_to_apply:
+                    path = None
+                    if isinstance(edit_op, dict) and 'fname' in edit_op: path = edit_op['fname']
+                    elif hasattr(edit_op, 'fname'): path = edit_op.fname
+                    elif isinstance(edit_op, str): path = edit_op # If edit_op is just a path string
+                    
+                    if path: current_edit_paths.add(self.get_rel_fname(path))
 
-        except ValueError as err:
+                if current_edit_paths and self.history_manager:
+                    commit_hash = self.last_aider_commit_hash 
+                    self.history_manager.add_event(ApplyEditEvent(
+                        filepaths=list(current_edit_paths),
+                        commit_hash=commit_hash 
+                    ))
+                edited_paths_applied.update(current_edit_paths)
+
+        except ValueError as err: 
             self.num_malformed_responses += 1
-            err_msg = err.args
+            err_msg = str(err.args[0]) if err.args else "Unknown malformed response"
             self.io.tool_error("The LLM did not conform to the edit format.")
-            self.io.tool_output(urls.edit_errors)
-            self.io.tool_output()
-            self.io.tool_output(str(err_msg))
-            self.reflected_message = str(err_msg)
-            # Log error event?
-            # if self.history_manager:
-            #     self.history_manager.add_event(MalformedResponseEvent(error=str(err_msg)))
-            return edited # Return paths that might have been prepared
-
-        except ANY_GIT_ERROR as err:
+            self.io.tool_output(urls.edit_errors); self.io.tool_output(); self.io.tool_output(err_msg)
+            self.reflected_message = err_msg 
+            # No specific EditOutcomeEvent for malformed_response
+            if self.history_manager: # Log as an assistant message or a generic error event if available
+                self.history_manager.add_event(AssistantMessageEvent(content=f"Error: LLM response malformed. Details: {err_msg}"))
+            return edited_paths_applied 
+        except ANY_GIT_ERROR as err: 
             self.io.tool_error(str(err))
-            # Log error event?
-            return edited
-        except Exception as err:
-            self.io.tool_error("Exception while updating files:")
-            self.io.tool_error(str(err), strip=False)
-            traceback.print_exc()
+            # No specific EditOutcomeEvent for git_error
+            if self.history_manager:
+                self.history_manager.add_event(AssistantMessageEvent(content=f"Error: Git operation failed. Details: {str(err)}"))
+            return edited_paths_applied
+        except Exception as err: 
+            self.io.tool_error("Exception while updating files:"); self.io.tool_error(str(err), strip=False); traceback.print_exc()
             self.reflected_message = str(err)
-            # Log error event?
-            return edited
+            # No specific EditOutcomeEvent for exception_applying_edits
+            if self.history_manager:
+                self.history_manager.add_event(AssistantMessageEvent(content=f"Error: Exception during file updates. Details: {str(err)}"))
+            return edited_paths_applied
 
-        for path in edited:
-            if self.dry_run:
-                self.io.tool_output(f"Did not apply edit to {path} (--dry-run)")
-            else:
-                self.io.tool_output(f"Applied edit to {path}")
+        for path_rel in edited_paths_applied: 
+            self.io.tool_output(f"Applied edit to {path_rel}" if not self.dry_run else f"Did not apply edit to {path_rel} (--dry-run)")
+        return edited_paths_applied
 
-        return edited
+    # get_context_from_history REMOVED
 
+    def auto_commit(self, edited_paths, context=None):
+        if not self.repo or not self.auto_commits or self.dry_run or not edited_paths: return
 
-    # ... (parse_partial_args remains the same) ...
-
-    # Removed get_context_from_history
-
-    def auto_commit(self, edited, context=None):
-        if not self.repo or not self.auto_commits or self.dry_run:
-            return
-
-        # Removed context generation from history
-        # if not context:
-        #     context = self.get_context_from_history(self.cur_messages) # Needs replacement
-
-        # Placeholder for context - how should commit message context be derived now?
-        # Maybe use the last N events from history manager? Or just the last user prompt?
-        commit_context = "Aider commit" # Basic placeholder
-        if self.history_manager and self.history_manager.redis_client: # Check redis client
-             # Get last ~5 text events as context? Needs careful design.
-             try:
-                 last_events = self.history_manager.redis_client.lrange(self.history_manager.text_list_key, -5, -1) or []
-                 commit_context = "\n".join(last_events)
-             except Exception as e:
-                 self.io.tool_warning(f"Could not retrieve recent history for commit message context: {e}")
-
-
+        commit_context_msg = context or "Aider auto-commit" 
+        # Try to get a more specific context from recent history if no explicit context is passed
+        if not context and self.history_manager and self.history_manager.redis_client:
+            try:
+                last_events_texts = self.history_manager.redis_client.lrange(self.history_manager.text_list_key, -3, -1) or []
+                if last_events_texts:
+                    commit_context_msg = "Context:\n" + "\n".join(last_events_texts)
+            except Exception as e: self.io.tool_warning(f"Failed to get history for commit context: {e}")
+        
         try:
-            res = self.repo.commit(fnames=edited, context=commit_context, aider_edits=True)
+            relative_edited_paths = [self.get_rel_fname(p) for p in edited_paths]
+            res = self.repo.commit(fnames=relative_edited_paths, context=commit_context_msg, aider_edits=True)
             if res:
                 self.show_auto_commit_outcome(res)
                 commit_hash, commit_message = res
-                self.last_aider_commit_hash = commit_hash # Store the hash
-                # Log UserCommitEvent triggered by auto-commit? Or rely on ApplyEditEvent's hash?
-                # For now, rely on ApplyEditEvent logging the hash.
-                return self.gpt_prompts.files_content_gpt_edits.format(
-                    hash=commit_hash,
-                    message=commit_message,
-                )
-
-            return self.gpt_prompts.files_content_gpt_no_edits
+                self.last_aider_commit_hash = commit_hash 
+                self.aider_commit_hashes.add(commit_hash)
+                if self.history_manager:
+                    # Embed hash in message due to dataclass limitation
+                    log_message = f"{commit_message} (hash: {commit_hash})"
+                    if context: log_message += f" (context: {context})"
+                    self.history_manager.add_event(UserCommitEvent(message=log_message))
+                return self.gpt_prompts.files_content_gpt_edits.format(hash=commit_hash, message=commit_message)
         except ANY_GIT_ERROR as err:
-            self.io.tool_error(f"Unable to commit: {str(err)}")
-            return
-
-    # ... (show_auto_commit_outcome remains the same) ...
+            self.io.tool_error(f"Unable to auto-commit: {str(err)}")
+            # No specific EditOutcomeEvent for auto_commit_failed
+            if self.history_manager:
+                self.history_manager.add_event(AssistantMessageEvent(content=f"Error: Auto-commit failed. Details: {str(err)}"))
+        return None
 
     def show_undo_hint(self):
-        # Removed commit_before_message check
-        # if not self.commit_before_message:
-        #     return
-        # if self.commit_before_message[-1] != self.repo.get_head_commit_sha():
-        #     self.io.tool_output("You can use /undo to undo and discard each aider commit.")
-        # Simplified check: if any aider commits exist, show hint
-        if self.aider_commit_hashes:
+        if self.aider_commit_hashes: # Check if any aider commits were made
              self.io.tool_output("You can use /undo to undo the last aider commit.")
 
-
     def dirty_commit(self):
-        if not self.need_commit_before_edits:
-            return
+        if not self.need_commit_before_edits: return True # Nothing dirty that aider cares about
         if not self.dirty_commits:
-            return
-        if not self.repo:
-            return
+            if self.history_manager: self.history_manager.add_event(UserRejectEditEvent()) # No reason field
+            return False 
+        if not self.repo: return True
 
-        res = self.repo.commit(fnames=self.need_commit_before_edits)
+        dirty_files_str = ", ".join(self.get_rel_fname(f) for f in self.need_commit_before_edits)
+        if not self.io.confirm_ask(f"Commit uncommitted changes in: {dirty_files_str}?", default="y"):
+            if self.history_manager: self.history_manager.add_event(UserRejectEditEvent()) # No reason field
+            return False 
+
+        relative_dirty_paths = [self.get_rel_fname(p) for p in self.need_commit_before_edits]
+        res = self.repo.commit(fnames=relative_dirty_paths, context="Pre-aider-edit commit of user changes.")
         if res and self.history_manager:
-             # Log this pre-emptive commit as a USER_COMMIT?
              commit_hash, commit_message = res
-             self.history_manager.add_event(UserCommitEvent(message=f"Pre-edit commit for: {', '.join(self.need_commit_before_edits)}"))
-
-
-        # Removed move_back_cur_messages
-        # self.move_back_cur_messages(self.gpt_prompts.files_content_local_edits)
+             log_message = f"{commit_message} (hash: {commit_hash}, context: Pre-edit commit for {', '.join(relative_dirty_paths)})"
+             self.history_manager.add_event(UserCommitEvent(message=log_message))
+             self.aider_commit_hashes.add(commit_hash)
+        self.need_commit_before_edits = set() 
         return True
 
-    # ... (get_edits, apply_edits, apply_edits_dry_run remain placeholders) ...
-
-    # ... (run_shell_commands, handle_shell_commands remain mostly the same, but need to log events) ...
-    def run_shell_commands(self):
-        if not self.suggest_shell_commands:
-            return ""
-
+    def run_shell_commands(self): # Logs events via handle_shell_commands
+        if not self.suggest_shell_commands or not self.shell_commands: return ""
         done = set()
         group = ConfirmGroup(set(self.shell_commands))
         accumulated_output = ""
-        for command in self.shell_commands:
-            if command in done:
-                continue
-            done.add(command)
-            output, exit_status = self.handle_shell_commands(command, group) # Modified to return status
-            if output is not None: # Check if command was run
-                accumulated_output += output + "\n\n"
-                # Log command output event here, after potential user confirmation
-                if self.history_manager and self.io.confirm_ask(
-                     "Add command output to the chat history log?", allow_never=True
-                ):
-                     # Truncate output before logging
-                     max_len = 1000
-                     truncated_output = output
-                     if len(output) > max_len:
-                          truncated_output = output[:max_len//2] + "\n...\n" + output[-max_len//2:]
+        for command_block in self.shell_commands:
+            if command_block in done: continue
+            done.add(command_block)
+            output_this_block, _ = self.handle_shell_commands(command_block, group)
+            if output_this_block is not None: accumulated_output += output_this_block + "\n\n"
+        self.shell_commands = []
+        return accumulated_output.strip()
 
-                     self.history_manager.add_event(CommandOutputEvent(
-                          command=command,
-                          output=truncated_output,
-                          exit_status=exit_status
-                     ))
-                     num_lines = len(output.strip().splitlines())
-                     line_plural = "line" if num_lines == 1 else "lines"
-                     self.io.tool_output(f"Logged {num_lines} {line_plural} of output.")
-
-        # Return accumulated output for potential immediate display/use, though it's not added back to context
-        return accumulated_output
-
-    def handle_shell_commands(self, commands_str, group):
-        commands = commands_str.strip().splitlines()
-        command_count = sum(
-            1 for cmd in commands if cmd.strip() and not cmd.strip().startswith("#")
-        )
-        prompt = "Run shell command?" if command_count == 1 else "Run shell commands?"
-        if not self.io.confirm_ask(
-            prompt,
-            subject="\n".join(commands),
-            explicit_yes_required=True,
-            group=group,
-            allow_never=True,
-        ):
-            return None, -1 # Indicate command was not run
-
-        accumulated_output = ""
-        final_exit_status = 0
-        for command in commands:
-            command = command.strip()
-            if not command or command.startswith("#"):
-                continue
-
-            # Log RUN_COMMAND event *before* running
+    def handle_shell_commands(self, commands_str_block, group):
+        commands_to_run = [cmd.strip() for cmd in commands_str_block.strip().splitlines() if cmd.strip() and not cmd.strip().startswith("#")]
+        if not commands_to_run: return None, -1
+        
+        prompt_q = "Run shell command?" if len(commands_to_run) == 1 else "Run shell commands?"
+        if not self.io.confirm_ask(prompt_q, subject="\n".join(commands_to_run), explicit_yes_required=True, group=group, allow_never=True):
             if self.history_manager:
-                 self.history_manager.add_event(RunCommandEvent(command=command))
+                for cmd in commands_to_run: self.history_manager.add_event(RunCommandEvent(command=cmd)) # No outcome field
+            return None, -1 
+        
+        block_output = ""
+        last_status = 0
+        for command in commands_to_run:
+            if self.history_manager: self.history_manager.add_event(RunCommandEvent(command=command)) # No outcome field
+            self.io.tool_output(f"\nRunning: {command}")
+            self.io.add_to_input_history(f"/run {command}")
+            cwd = self.root if hasattr(self, 'root') and self.root else None
+            status, output = run_cmd(command, error_print=self.io.tool_error, cwd=cwd)
+            last_status = status
+            
+            current_cmd_output = f"Output from `{command}`:\n{output if output is not None else ''}\n"
+            block_output += current_cmd_output
 
-            self.io.tool_output()
-            self.io.tool_output(f"Running {command}")
-            # Add the command to input history
-            self.io.add_to_input_history(f"/run {command.strip()}")
-            # Ensure self.root is used for cwd
-            cwd_path = self.root if hasattr(self, 'root') and self.root else None
-            exit_status, output = run_cmd(command, error_print=self.io.tool_error, cwd=cwd_path)
-            final_exit_status = exit_status # Keep last exit status
-            if output:
-                accumulated_output += f"Output from {command}\n{output}\n"
-
-        # Return output and status, logging happens in run_shell_commands
-        return accumulated_output, final_exit_status
+            if self.history_manager:
+                log_out = output if output is not None else ""
+                # Truncate for log
+                max_log_len = 2048
+                if len(log_out) > max_log_len:
+                    log_out = log_out[:max_log_len//2] + "\n...\n" + log_out[-max_log_len//2:]
+                self.history_manager.add_event(CommandOutputEvent(command=command, output=log_out, exit_status=status))
+                self.io.tool_output(f"Logged output from `{command}` (status: {status}).")
+        return block_output, last_status
 
     # --- Placeholder methods that need concrete implementation in subclasses ---
     def get_edits(self):

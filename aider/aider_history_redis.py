@@ -1,6 +1,7 @@
 import json
 import time
 import redis
+import re # Import re module
 from dataclasses import dataclass, field, asdict
 from typing import List, Optional, Dict, Union, Callable, Any
 
@@ -143,6 +144,7 @@ class RedisHistoryManager:
         redis_db: int = 0,
         session_id: str = 'default_session', # Use a unique ID per chat session
         redis_password: Optional[str] = None,
+        verbose: bool = False,
     ):
         """
         Initializes the Redis connection and sets keys for the session.
@@ -167,14 +169,19 @@ class RedisHistoryManager:
             )
             # Test connection
             self.redis_client.ping()
+            self.verbose = verbose # Store verbose flag
+            if self.verbose:
+                print(f"RedisHistoryManager initialized. Verbose: {self.verbose}")
             print(f"Connected to Redis. History keys: {self.json_list_key}, {self.text_list_key}")
         except redis.exceptions.ConnectionError as e:
             print(f"Error connecting to Redis: {e}")
             print("History management will not function.")
             self.redis_client = None
+            self.verbose = False # Ensure verbose is false if connection fails
         except Exception as e:
              print(f"Unexpected error during Redis connection: {e}")
              self.redis_client = None
+             self.verbose = False # Ensure verbose is false on other exceptions
 
 
     def _format_event_to_text(self, event: BaseEvent) -> str:
@@ -256,7 +263,7 @@ class RedisHistoryManager:
         self,
         max_tokens: int,
         tokenizer_func: Callable[[Union[str, List[Dict[str, str]]]], int],
-        # compaction_level: int = 0 # Placeholder for future compaction logic
+        compaction_level: int = 0
     ) -> List[Dict[str, str]]:
         """
         Generates the list of message dictionaries for the LLM context,
@@ -292,14 +299,55 @@ class RedisHistoryManager:
         final_event_count = 0
 
         # Iterate backwards (most recent first)
-        for event_text in reversed(all_event_texts):
-            # --- Apply Compaction Logic Here (Future) ---
-            # Example: Skip simple assistant 'Ok.' messages if compaction level > 0
-            # if compaction_level > 0 and event_text == "[EVENT: ASSISTANT_MESSAGE] content=Ok.":
-            #     continue
+        num_total_events = len(all_event_texts)
+        for i, event_text_original in enumerate(reversed(all_event_texts)):
+            event_text_to_process = event_text_original
+            is_event_skipped_by_compaction = False
+            original_event_age_rank = i # 0 is most recent, num_total_events-1 is oldest in this reversed iteration
 
-            role = self._get_role_from_event_text(event_text)
-            message = {"role": role, "content": event_text}
+            # --- Apply Compaction Logic Here ---
+            if compaction_level >= 1:
+                match = re.match(r"\[EVENT: ([\w_]+)\](.*)", event_text_original)
+                if match:
+                    event_type_str = match.group(1)
+                    event_data_str = match.group(2).strip()
+
+                    # Rule 1: Skip trivial assistant messages if they are not "very recent"
+                    if event_type_str == "ASSISTANT_MESSAGE":
+                        # "Very recent" means original_event_age_rank is small.
+                        # Skip if older than the 3rd most recent original event.
+                        if original_event_age_rank > 3:
+                            content_match = re.search(r"content=(.*)", event_data_str)
+                            if content_match:
+                                content_val = content_match.group(1).strip()
+                                trivial_contents = ["Ok.", "Okay.", "Understood.", "Got it.", "Done."]
+                                if content_val in trivial_contents:
+                                    is_event_skipped_by_compaction = True
+                                    if self.verbose:
+                                        print(f"Compaction (L1): Skipped trivial assistant message (age rank {original_event_age_rank}): {event_text_original[:100]}...")
+                    
+                    # Rule 2: For older CommandOutputEvent, if output is very long, replace with summary
+                    elif event_type_str == "COMMAND_OUTPUT":
+                        # Skip if older than the 7th most recent original event AND long
+                        if original_event_age_rank > 7 and len(event_text_original) > 300:
+                            command_match = re.search(r"command=((?:\\.|[^,])+)", event_data_str)
+                            status_match = re.search(r"exit_status=(\d+)", event_data_str)
+                            
+                            cmd_name = command_match.group(1) if command_match else "unknown_command"
+                            # Unescape command name if needed, for simple display it's fine
+                            cmd_name = cmd_name.replace("\\,", ",").replace("\\\\[", "[").replace("\\\\]", "]")
+
+                            status = status_match.group(1) if status_match else "unknown_status"
+                            
+                            event_text_to_process = f"[EVENT: COMMAND_OUTPUT] command={cmd_name}, output=[truncated due to age/size], exit_status={status}"
+                            if self.verbose:
+                                print(f"Compaction (L1): Truncated old command output (age rank {original_event_age_rank}): {event_text_original[:100]}... -> {event_text_to_process}")
+            
+            if is_event_skipped_by_compaction:
+                continue
+
+            role = self._get_role_from_event_text(event_text_to_process)
+            message = {"role": role, "content": event_text_to_process}
 
             # Estimate token count for this message *plus* existing selected
             potential_messages = [message] + selected_messages
@@ -310,7 +358,7 @@ class RedisHistoryManager:
             except Exception as e:
                  print(f"Warning: Tokenizer function failed during context generation. Error: {e}. Estimating token count.")
                  # Simple estimation if tokenizer fails
-                 potential_tokens = current_tokens + len(event_text.split()) * 2 # Rough estimate
+                 potential_tokens = current_tokens + len(event_text_to_process.split()) * 2 # Rough estimate
 
             if potential_tokens <= max_tokens:
                 selected_messages.insert(0, message) # Insert at beginning to maintain order

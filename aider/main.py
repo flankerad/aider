@@ -35,7 +35,12 @@ from aider.repo import ANY_GIT_ERROR, GitRepo
 from aider.report import report_uncaught_exceptions
 from aider.versioncheck import check_version, install_from_main_branch, install_upgrade
 from aider.watch import FileWatcher
-from aider.aider_history_redis import RedisHistoryManager # Import the new history manager
+from aider.aider_history_redis import (
+    RedisHistoryManager,
+    UserPromptEvent,
+    # Add other event types if directly used in main.py, though unlikely
+)
+from aider.exceptions import CommandCompletionException # Ensure this is present
 
 from .dump import dump  # noqa: F401
 
@@ -920,17 +925,32 @@ def main(argv=None, input=None, output=None, force_git_root=None, return_coder=F
         analytics.event("no-repo")
 
     # Instantiate RedisHistoryManager
-    history_manager = RedisHistoryManager(
-        redis_host=args.redis_host,
-        redis_port=args.redis_port,
-        redis_db=args.redis_db,
-        session_id=args.session_id,
-        redis_password=args.redis_password,
-    )
-    if not history_manager.redis_client:
-        io.tool_error("Failed to connect to Redis. Exiting.")
-        analytics.event("exit", reason="Redis connection failed")
-        return 1
+    history_manager = None
+    if args.redis_host: # Check if redis is configured
+        try:
+            history_manager = RedisHistoryManager(
+                redis_host=args.redis_host,
+                redis_port=args.redis_port,
+                redis_db=args.redis_db,
+                session_id=args.session_id,
+                redis_password=args.redis_password,
+                verbose=args.verbose, # Pass verbose flag
+            )
+            if not history_manager.redis_client:
+                io.tool_error("Failed to connect to Redis. Aider will run without Redis history.")
+                analytics.event("redis_connection_failed")
+                history_manager = None
+            else:
+                io.tool_output(f"Using Redis for chat history (Session ID: {args.session_id}).")
+                analytics.event("redis_history_enabled")
+        except Exception as e:
+            io.tool_error(f"Error initializing RedisHistoryManager: {e}")
+            io.tool_error("Aider will run without Redis history.")
+            analytics.event("redis_init_exception", exception=str(e))
+            history_manager = None
+    else:
+        io.tool_output("Redis host not configured. Running without Redis-backed history.")
+        analytics.event("redis_history_disabled_no_host")
 
 
     commands = Commands(
@@ -947,11 +967,8 @@ def main(argv=None, input=None, output=None, force_git_root=None, return_coder=F
         original_read_only_fnames=read_only_fnames,
     )
 
-    # Removed ChatSummary instantiation
-    # summarizer = ChatSummary(
-    #     [main_model.weak_model, main_model],
-    #     args.max_chat_history_tokens or main_model.max_chat_history_tokens,
-    # )
+    # Remove ChatSummary instantiation:
+    # summarizer = ChatSummary(...)
 
     if args.cache_prompts and args.map_refresh == "auto":
         args.map_refresh = "files"
@@ -987,15 +1004,15 @@ def main(argv=None, input=None, output=None, force_git_root=None, return_coder=F
             verbose=args.verbose,
             stream=args.stream,
             use_git=args.git,
-            # restore_chat_history=args.restore_chat_history, # Removed
+            # restore_chat_history=args.restore_chat_history, # REMOVED
             auto_lint=args.auto_lint,
             auto_test=args.auto_test,
             lint_cmds=lint_cmds,
             test_cmd=args.test_cmd,
             commands=commands,
-            # summarizer=summarizer, # Removed
-            history_manager=history_manager, # Pass the new history manager
-            total_cost=0.0, # Start cost at 0 for new session
+            # summarizer=summarizer, # REMOVED
+            history_manager=history_manager, # ADDED
+            total_cost=0.0, 
             analytics=analytics,
             map_refresh=args.map_refresh,
             cache_prompts=args.cache_prompts,
@@ -1047,10 +1064,14 @@ def main(argv=None, input=None, output=None, force_git_root=None, return_coder=F
     coder.show_announcements()
 
     if args.show_prompts:
-        # Need to add a dummy user message to trigger context generation
-        coder.history_manager.add_event(UserPromptEvent(content="Hello!"))
-        messages = coder.format_messages().all_messages()
-        utils.show_messages(messages)
+        if coder.history_manager: # Check if history_manager exists
+            # Add a dummy event to ensure context generation can proceed if history is empty
+            # This is a temporary measure; actual context will be built from real events.
+            # A better approach might be for generate_llm_context to handle empty history gracefully.
+            if not coder.history_manager.redis_client.lrange(coder.history_manager.text_list_key, 0, 0):
+                 coder.history_manager.add_event(UserPromptEvent(content="Show prompts (dummy event for context generation)"))
+        messages = coder.format_messages().all_messages() # format_messages now uses history_manager
+        utils.show_messages(messages, functions=coder.functions)
         analytics.event("exit", reason="Showed prompts")
         return
 
@@ -1169,25 +1190,36 @@ def main(argv=None, input=None, output=None, force_git_root=None, return_coder=F
         except SwitchCoder as switch:
             coder.ok_to_warm_cache = False
 
-            # Set the placeholder if provided
             if hasattr(switch, "placeholder") and switch.placeholder is not None:
                 io.placeholder = switch.placeholder
 
-            kwargs = dict(io=io, from_coder=coder)
+            current_coder_history_manager = coder.history_manager # Preserve current history manager
+
+            kwargs = dict(io=io, from_coder=coder) # from_coder will pass its history_manager
             kwargs.update(switch.kwargs)
             if "show_announcements" in kwargs:
                 del kwargs["show_announcements"]
 
-            # Ensure history_manager is passed to the new coder
-            kwargs['history_manager'] = coder.history_manager
-
+            # Explicitly ensure history_manager is passed if it was somehow dropped by from_coder logic
+            if 'history_manager' not in kwargs or kwargs['history_manager'] is None:
+                kwargs['history_manager'] = current_coder_history_manager
+            
             coder = Coder.create(**kwargs)
-            # Ensure commands object has the new coder reference
-            coder.commands.coder = coder
-
+            coder.commands.coder = coder 
 
             if switch.kwargs.get("show_announcements") is not False:
                 coder.show_announcements()
+        except CommandCompletionException: 
+            io.tool_output("Command completion request detected.")
+            analytics.event("exit", reason="Command completion exception")
+            return 
+        except EOFError:
+            analytics.event("exit", reason="EOF received")
+            return
+        except KeyboardInterrupt:
+            analytics.event("exit", reason="Keyboard interrupt in main loop")
+            io.tool_output("\nExiting...")
+            return
 
 
 def is_first_run_of_new_version(io, verbose=False):

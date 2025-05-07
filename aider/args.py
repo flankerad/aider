@@ -170,8 +170,7 @@ def get_parser(default_config_files, git_root):
         metavar="WEAK_MODEL",
         default=None,
         help=(
-            "Specify the model to use for commit messages and chat history summarization (default"
-            " depends on --model)"
+            "Specify the model to use for commit messages (default depends on --model)"
         ),
     )
     group.add_argument(
@@ -251,7 +250,10 @@ def get_parser(default_config_files, git_root):
     )
 
     ##########
-    group = parser.add_argument_group("History Files and Redis")
+    group = parser.add_argument_group(
+        "History Files and Redis",
+        "Options for configuring input history, LLM conversation logging, and Redis-backed chat history. See https://aider.chat/docs/history.html#redis-history for Redis details.",
+    )
     default_input_history_file = (
         os.path.join(git_root, ".aider.input.history") if git_root else ".aider.input.history"
     )
@@ -286,25 +288,31 @@ def get_parser(default_config_files, git_root):
     # Redis arguments
     group.add_argument(
         "--redis-host",
+        type=str,
         default="localhost",
-        help="Redis server hostname (default: localhost)"
+        help="Redis server hostname (default: localhost). Env var: AIDER_REDIS_HOST",
+        metavar="HOST",
     )
     group.add_argument(
         "--redis-port",
         type=int,
         default=6379,
-        help="Redis server port (default: 6379)"
+        help="Redis server port (default: 6379). Env var: AIDER_REDIS_PORT",
+        metavar="PORT",
     )
     group.add_argument(
         "--redis-db",
         type=int,
         default=0,
-        help="Redis database number (default: 0)"
+        help="Redis database number (default: 0). Env var: AIDER_REDIS_DB",
+        metavar="DB",
     )
     group.add_argument(
         "--redis-password",
+        type=str,
         default=None,
-        help="Redis password (default: None)"
+        help="Redis password (default: None). Env var: AIDER_REDIS_PASSWORD",
+        metavar="PASSWORD",
     )
     group.add_argument(
         "--session-id",
@@ -315,7 +323,8 @@ def get_parser(default_config_files, git_root):
         "--history-max-tokens",
         type=int,
         default=4096, # Default history token limit
-        help="Maximum tokens to allocate for history context sent to LLM (default: 4096)"
+        help="Maximum tokens to allocate for history context constructed by RedisHistoryManager (default: 4096). Env var: AIDER_HISTORY_MAX_TOKENS",
+        metavar="TOKENS",
     )
 
 
